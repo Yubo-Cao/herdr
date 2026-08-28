@@ -76,6 +76,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+        collaboration_protocol: Some(crate::protocol::COLLABORATION_PROTOCOL_VERSION),
     })
 }
 
@@ -1088,6 +1089,7 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                collaboration_protocol: Some(crate::protocol::COLLABORATION_PROTOCOL_VERSION),
             }),
             None,
             None,

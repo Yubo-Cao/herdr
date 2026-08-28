@@ -833,6 +833,7 @@ fn client_launch_mode(
 /// response. Returns Ok(()) on success, or an error if the server rejects us.
 fn do_handshake(
     stream: &mut LocalStream,
+    protocol_version: u32,
     cols: u16,
     rows: u16,
     cell_width_px: u32,
@@ -840,14 +841,14 @@ fn do_handshake(
     exact_cell_size: bool,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
-) -> Result<RenderEncoding, ClientError> {
+) -> Result<(RenderEncoding, u32), ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
     // Send Hello.
     let hello = ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
+        version: protocol_version,
         cols,
         rows,
         cell_width_px,
@@ -886,13 +887,70 @@ fn do_handshake(
             if let Some(error) = error {
                 return Err(ClientError::HandshakeRejected { version, error });
             }
+            if version != protocol_version {
+                return Err(ClientError::Protocol(protocol::FramingError::Io(
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "server welcomed protocol {version}, but client requested {protocol_version}"
+                        ),
+                    ),
+                )));
+            }
             info!(version, ?encoding, "handshake succeeded");
-            Ok(encoding)
+            Ok((encoding, version))
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
             io::Error::new(io::ErrorKind::InvalidData, "expected Welcome message"),
         ))),
     }
+}
+
+fn desired_client_protocol() -> u32 {
+    let status =
+        crate::api::read_runtime_status_at(&crate::api::socket_path(), Duration::from_millis(250))
+            .ok()
+            .flatten();
+    let advertised = status
+        .and_then(|status| status.capabilities)
+        .and_then(|capabilities| capabilities.collaboration_protocol);
+    client_protocol_for_advertisement(advertised)
+}
+
+fn client_protocol_for_advertisement(advertised: Option<u32>) -> u32 {
+    if advertised == Some(protocol::COLLABORATION_PROTOCOL_VERSION) {
+        protocol::COLLABORATION_PROTOCOL_VERSION
+    } else {
+        PROTOCOL_VERSION
+    }
+}
+
+fn collaboration_display_name() -> String {
+    ["HERDR_COLLAB_NAME", "USER", "USERNAME"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| format!("client-{}", std::process::id()))
+}
+
+fn announce_collaboration_identity(
+    stream: &mut LocalStream,
+    protocol_version: u32,
+) -> Result<(), ClientError> {
+    if protocol_version != protocol::COLLABORATION_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    write_to_server(
+        stream,
+        &ClientMessage::CollaborationIdentity {
+            display_name: collaboration_display_name(),
+        },
+    )
+    .map_err(ClientError::ConnectionLost)
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,8 +1089,10 @@ fn connect_terminal_session_stream(
         }
     };
 
+    let protocol_version = desired_client_protocol();
     match do_handshake(
         &mut stream,
+        protocol_version,
         cols,
         rows,
         0,
@@ -1041,8 +1101,13 @@ fn connect_terminal_session_stream(
         RenderEncoding::TerminalAnsi,
         true,
     ) {
-        Ok(RenderEncoding::TerminalAnsi) => {}
-        Ok(encoding) => {
+        Ok((RenderEncoding::TerminalAnsi, negotiated_protocol)) => {
+            if let Err(err) = announce_collaboration_identity(&mut stream, negotiated_protocol) {
+                eprintln!("herdr: {err}");
+                std::process::exit(1);
+            }
+        }
+        Ok((encoding, _)) => {
             eprintln!(
                 "herdr: terminal session observe negotiated unsupported encoding {encoding:?}"
             );
@@ -1262,8 +1327,10 @@ fn run_client_with_mode(
         initial_terminal_geometry(kitty_graphics_enabled);
 
     // Perform handshake while the stream is still in blocking mode.
-    let negotiated_encoding = match do_handshake(
+    let protocol_version = desired_client_protocol();
+    let (negotiated_encoding, negotiated_protocol) = match do_handshake(
         &mut stream,
+        protocol_version,
         cols,
         rows,
         cell_width_px,
@@ -1272,12 +1339,17 @@ fn run_client_with_mode(
         requested_encoding,
         direct_attach_requested,
     ) {
-        Ok(encoding) => encoding,
+        Ok(handshake) => handshake,
         Err(err) => {
             eprintln!("herdr: {err}");
             std::process::exit(1);
         }
     };
+
+    if let Err(err) = announce_collaboration_identity(&mut stream, negotiated_protocol) {
+        eprintln!("herdr: {err}");
+        std::process::exit(1);
+    }
 
     if let Some((terminal_id, takeover)) = attach_request {
         let attach = ClientMessage::AttachTerminal {
@@ -2649,6 +2721,23 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collaboration_protocol_negotiation_silently_downgrades_without_advertisement() {
+        assert_eq!(client_protocol_for_advertisement(None), PROTOCOL_VERSION);
+        assert_eq!(
+            client_protocol_for_advertisement(Some(PROTOCOL_VERSION)),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(
+            client_protocol_for_advertisement(Some(999)),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(
+            client_protocol_for_advertisement(Some(protocol::COLLABORATION_PROTOCOL_VERSION)),
+            protocol::COLLABORATION_PROTOCOL_VERSION
+        );
+    }
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 

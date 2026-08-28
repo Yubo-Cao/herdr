@@ -9812,6 +9812,15 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "collaboration_protocol": {
+              "description": "Optional private TUI protocol level for collaboration-aware clients.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

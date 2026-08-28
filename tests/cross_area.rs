@@ -939,7 +939,7 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
 }
 
 #[test]
-fn cross_area_two_clients_shared_view_and_single_detach_stability() {
+fn cross_area_two_clients_share_output_without_view_lockstep_and_survive_detach() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -967,11 +967,13 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
         .expect("root pane id")
         .to_string();
 
-    // Input from client A should update shared state visible to client B.
-    send_client_input(&mut client_a, b"echo SHARED_VIEW\n");
+    // The API-created workspace is materialized in foreground client B's view.
+    // Input there updates shared terminal state and is broadcast to client A
+    // without forcing A to switch its independent workspace/tab projection.
+    send_client_input(&mut client_b, b"echo SHARED_VIEW\n");
     assert!(
-        wait_for_frame(&mut client_b, Duration::from_secs(2)),
-        "client B should receive update from client A"
+        wait_for_frame(&mut client_a, Duration::from_secs(2)),
+        "client A should receive the shared update from client B"
     );
     assert!(pane_read_recent_contains(
         &api_socket,
@@ -980,7 +982,7 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
         Duration::from_secs(5)
     ));
 
-    // Detach client A; client B should keep working.
+    // Detach client A; client B should keep working in its own view.
     send_client_detach(&mut client_a);
     drop(client_a);
 

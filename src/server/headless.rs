@@ -27,7 +27,9 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::traits::Stream as _;
 #[cfg(unix)]
 use interprocess::local_socket::ListenerNonblockingMode;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -53,6 +55,9 @@ use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
     ClientConnection, ClientConnectionMode, DeferredRender,
+};
+use crate::server::collaboration::{
+    materialized_location, ClientViewState, ControlLeaseRegistry, LeaseAcquire, ParticipantPresence,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -296,6 +301,8 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    /// Client whose presentation projection is currently materialized in `app.state`.
+    materialized_view_client_id: Option<u64>,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -316,6 +323,8 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Exclusive short-lived ownership for full-app terminal input.
+    control_leases: ControlLeaseRegistry,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -514,6 +523,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            materialized_view_client_id: None,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -523,6 +533,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            control_leases: ControlLeaseRegistry::new(Duration::from_secs(30)),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -1558,6 +1569,50 @@ impl HeadlessServer {
         )
     }
 
+    fn capture_materialized_client_view(&mut self) {
+        let Some(client_id) = self.materialized_view_client_id else {
+            return;
+        };
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.view_state = Some(ClientViewState::capture(&self.app.state));
+            client.presence.location = materialized_location(&self.app.state);
+        }
+    }
+
+    fn activate_client_view(&mut self, client_id: u64) -> bool {
+        if self.materialized_view_client_id == Some(client_id) {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.presence.location = materialized_location(&self.app.state);
+            }
+            return false;
+        }
+        if !self.clients.contains_key(&client_id) {
+            return false;
+        }
+        self.capture_materialized_client_view();
+        let view = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_state.clone())
+            .unwrap_or_else(|| ClientViewState::capture(&self.app.state));
+        view.apply(&mut self.app.state);
+        self.materialized_view_client_id = Some(client_id);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.view_state = None;
+            client.presence.location = materialized_location(&self.app.state);
+        }
+        true
+    }
+
+    fn restore_foreground_client_view(&mut self) {
+        if let Some(client_id) = self.foreground_client_id {
+            self.activate_client_view(client_id);
+        } else {
+            self.capture_materialized_client_view();
+            self.materialized_view_client_id = None;
+        }
+    }
+
     fn promote_client_to_foreground(&mut self, client_id: u64) -> bool {
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
@@ -1566,6 +1621,7 @@ impl HeadlessServer {
         client.last_activity = stamp;
 
         let changed = self.foreground_client_id != Some(client_id);
+        self.activate_client_view(client_id);
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
         changed
@@ -1574,6 +1630,12 @@ impl HeadlessServer {
     fn promote_latest_remaining_client(&mut self) -> bool {
         let next_foreground = latest_app_client(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
+        if let Some(client_id) = next_foreground {
+            self.activate_client_view(client_id);
+        } else {
+            self.capture_materialized_client_view();
+            self.materialized_view_client_id = None;
+        }
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
         changed
@@ -1599,9 +1661,243 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
+    fn acquire_terminal_control(
+        &mut self,
+        client_id: u64,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Result<(), u64> {
+        // Protocol 21 retains stock Herdr's unrestricted shared-input behavior.
+        // Leases are an opt-in collaboration-v22 semantic, which is what makes
+        // a custom server a silent downgrade target for traditional clients.
+        if !self.clients.get(&client_id).is_some_and(|client| {
+            client.protocol_version == protocol::COLLABORATION_PROTOCOL_VERSION
+        }) {
+            return Ok(());
+        }
+        match self
+            .control_leases
+            .acquire(terminal_id, client_id, Instant::now())
+        {
+            LeaseAcquire::Acquired | LeaseAcquire::Refreshed => Ok(()),
+            LeaseAcquire::Blocked { owner } => Err(owner),
+        }
+    }
+
+    fn notify_terminal_control_blocked(&mut self, client_id: u64, owner: u64) {
+        let owner_name = self
+            .clients
+            .get(&owner)
+            .map(|client| client.presence.display_name.clone())
+            .unwrap_or_else(|| format!("guest-{owner}"));
+        self.send_to_client(
+            client_id,
+            ServerMessage::Notify {
+                kind: protocol::NotifyKind::Toast,
+                message: format!("{owner_name} is controlling this pane"),
+                body: Some("Control passes automatically after 30 seconds of inactivity.".into()),
+            },
+        );
+    }
+
+    fn update_client_pointer_from_events(
+        &mut self,
+        client_id: u64,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> bool {
+        // Legacy clients neither understand nor render collaboration presence.
+        // Keep their passive mouse traffic render-neutral unless at least one
+        // collaboration-aware viewer can actually observe the pointer.
+        if !self.clients.values().any(|client| {
+            client.writer.is_some()
+                && client.protocol_version == protocol::COLLABORATION_PROTOCOL_VERSION
+        }) {
+            return false;
+        }
+        let Some(mouse) = events.iter().rev().find_map(|event| match event {
+            crate::raw_input::RawInputEvent::Mouse(mouse) => Some(*mouse),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let pointer = self
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| {
+                mouse.column >= info.inner_rect.x
+                    && mouse.column < info.inner_rect.x.saturating_add(info.inner_rect.width)
+                    && mouse.row >= info.inner_rect.y
+                    && mouse.row < info.inner_rect.y.saturating_add(info.inner_rect.height)
+            })
+            .map(|info| crate::server::collaboration::GhostPointer {
+                pane_id: info.id,
+                column: mouse.column.saturating_sub(info.inner_rect.x),
+                row: mouse.row.saturating_sub(info.inner_rect.y),
+                updated_at: Instant::now(),
+            });
+        let changed = self.clients.get(&client_id).is_some_and(|client| {
+            match (client.presence.pointer.as_ref(), pointer.as_ref()) {
+                (Some(previous), Some(next)) => {
+                    previous.pane_id != next.pane_id
+                        || previous.column != next.column
+                        || previous.row != next.row
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        });
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.presence.pointer = pointer;
+        }
+        if changed {
+            for client in self.clients.values_mut() {
+                if client.protocol_version == protocol::COLLABORATION_PROTOCOL_VERSION {
+                    client.request_repaint();
+                }
+            }
+        }
+        changed
+    }
+
+    fn overlay_collaboration_presence(&self, viewer_id: u64, buffer: &mut Buffer, now: Instant) {
+        if !self.clients.get(&viewer_id).is_some_and(|client| {
+            client.protocol_version == protocol::COLLABORATION_PROTOCOL_VERSION
+        }) {
+            return;
+        }
+        let Some(viewer_location) = materialized_location(&self.app.state) else {
+            return;
+        };
+        let Some(workspace) = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == viewer_location.workspace_id)
+        else {
+            return;
+        };
+        let Some(tab) = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.number == viewer_location.tab_number)
+        else {
+            return;
+        };
+
+        const COLORS: [Color; 8] = [
+            Color::Cyan,
+            Color::Magenta,
+            Color::Yellow,
+            Color::Green,
+            Color::Blue,
+            Color::Red,
+            Color::LightCyan,
+            Color::LightMagenta,
+        ];
+        const POINTER_TTL: Duration = Duration::from_secs(5);
+
+        for info in &self.app.state.view.pane_infos {
+            let mut participant_names = Vec::new();
+            let mut label_color = self.app.state.palette.overlay0;
+            for (&client_id, client) in &self.clients {
+                if client_id == viewer_id || client.writer.is_none() {
+                    continue;
+                }
+                let Some(location) = client.presence.location.as_ref() else {
+                    continue;
+                };
+                if location.workspace_id != viewer_location.workspace_id
+                    || location.tab_number != viewer_location.tab_number
+                    || location.pane_id != info.id
+                {
+                    continue;
+                }
+                let color = COLORS[client.presence.color_index % COLORS.len()];
+                if participant_names.is_empty() {
+                    label_color = color;
+                }
+                participant_names.push(client.presence.display_name.clone());
+
+                if let Some(pointer) = client.presence.pointer.as_ref().filter(|pointer| {
+                    pointer.pane_id == info.id
+                        && now.saturating_duration_since(pointer.updated_at) <= POINTER_TTL
+                }) {
+                    let x = info.inner_rect.x.saturating_add(pointer.column);
+                    let y = info.inner_rect.y.saturating_add(pointer.row);
+                    if x < info.inner_rect.x.saturating_add(info.inner_rect.width)
+                        && y < info.inner_rect.y.saturating_add(info.inner_rect.height)
+                        && x >= buffer.area.x
+                        && x < buffer.area.x.saturating_add(buffer.area.width)
+                        && y >= buffer.area.y
+                        && y < buffer.area.y.saturating_add(buffer.area.height)
+                    {
+                        buffer[(x, y)]
+                            .set_symbol("◆")
+                            .set_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
+                    }
+                }
+            }
+
+            let terminal_id = tab
+                .panes
+                .get(&info.id)
+                .map(|pane| &pane.attached_terminal_id);
+            let control_owner =
+                terminal_id.and_then(|terminal_id| self.control_leases.owner(terminal_id, now));
+            let control_label = control_owner.map(|owner| {
+                if owner == viewer_id {
+                    "you control".to_owned()
+                } else {
+                    let name = self
+                        .clients
+                        .get(&owner)
+                        .map(|client| client.presence.display_name.as_str())
+                        .unwrap_or("another participant");
+                    format!("{name} controls")
+                }
+            });
+            if participant_names.is_empty() && control_label.is_none() {
+                continue;
+            }
+
+            let mut parts = Vec::new();
+            if !participant_names.is_empty() {
+                parts.push(format!("{} also here", participant_names.join(", ")));
+            }
+            if let Some(control_label) = control_label {
+                parts.push(control_label);
+            }
+            let label = format!(" {} ", parts.join(" · "));
+            let y = info.inner_rect.y.saturating_sub(1);
+            let x = info.inner_rect.x;
+            if y >= buffer.area.y
+                && y < buffer.area.y.saturating_add(buffer.area.height)
+                && x >= buffer.area.x
+                && x < buffer.area.x.saturating_add(buffer.area.width)
+            {
+                buffer.set_stringn(
+                    x,
+                    y,
+                    label,
+                    info.inner_rect.width as usize,
+                    Style::default()
+                        .fg(label_color)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+
     fn remove_client(&mut self, client_id: u64) -> bool {
         self.retire_direct_graphics_for_client(client_id);
         let was_foreground = self.foreground_client_id == Some(client_id);
+        if self.materialized_view_client_id == Some(client_id) {
+            self.materialized_view_client_id = None;
+        }
+        self.control_leases.remove_client(client_id);
         self.app.clear_input_source(client_id);
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
@@ -2923,6 +3219,12 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .is_some_and(ClientConnection::is_full_app_client);
+        let pointer_changed = if source_is_full_app {
+            self.activate_client_view(client_id);
+            self.update_client_pointer_from_events(client_id, &events)
+        } else {
+            false
+        };
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
@@ -2964,14 +3266,23 @@ impl HeadlessServer {
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
-        self.app.route_client_events_from(client_id, events, false);
-        if self.app.take_config_reloaded_from_disk() {
-            self.reload_server_config(false);
-        } else {
-            self.sync_foreground_client_state();
+        let mut blocked_owner = None;
+        for event in events {
+            if let Some(terminal_id) = self.app.collaboration_terminal_target(&event) {
+                if let Err(owner) = self.acquire_terminal_control(client_id, &terminal_id) {
+                    blocked_owner.get_or_insert(owner);
+                    continue;
+                }
+            }
+            self.app
+                .route_client_events_from(client_id, vec![event], false);
         }
-
-        if self.app.state.detach_requested {
+        if let Some(owner) = blocked_owner {
+            self.notify_terminal_control_blocked(client_id, owner);
+        }
+        let config_reloaded = self.app.take_config_reloaded_from_disk();
+        let detach_requested = self.app.state.detach_requested;
+        if detach_requested {
             self.app.state.detach_requested = false;
             info!(client_id, "client detach requested via keybind");
 
@@ -2986,11 +3297,21 @@ impl HeadlessServer {
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.writer = None;
             }
-
-            false
-        } else {
-            foreground_changed || theme_changed || (interaction && !render_neutral_mouse_motion)
         }
+
+        self.capture_materialized_client_view();
+        self.restore_foreground_client_view();
+        if config_reloaded {
+            self.reload_server_config(false);
+        } else {
+            self.sync_foreground_client_state();
+        }
+
+        !detach_requested
+            && (foreground_changed
+                || theme_changed
+                || pointer_changed
+                || (interaction && !render_neutral_mouse_motion))
     }
 
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
@@ -3008,6 +3329,7 @@ impl HeadlessServer {
                 keybindings,
                 writer,
                 render_encoding,
+                protocol_version,
                 direct_attach_requested,
                 direct_graphics,
             } => {
@@ -3050,10 +3372,14 @@ impl HeadlessServer {
                     direct_attach_requested,
                     Some(writer),
                 );
+                connection.protocol_version = protocol_version;
+                connection.presence = ParticipantPresence::anonymous(client_id);
+                connection.view_state = Some(ClientViewState::capture(&self.app.state));
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
                 self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
+                    self.activate_client_view(client_id);
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -3062,6 +3388,21 @@ impl HeadlessServer {
                 self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
                 self.nudge_handoff_panes_on_first_client_attach();
+                true
+            }
+            ServerEvent::ClientCollaborationIdentity {
+                client_id,
+                display_name,
+            } => {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return false;
+                };
+                client.presence.set_display_name(&display_name, client_id);
+                for client in self.clients.values_mut() {
+                    if client.is_full_app_client() {
+                        client.request_repaint();
+                    }
+                }
                 true
             }
             ServerEvent::GraphicsTransmissionResult {
@@ -3138,12 +3479,23 @@ impl HeadlessServer {
                     return false;
                 }
                 debug!(client_id, len = data.len(), "client input received");
-                if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
-                {
-                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                let direct_terminal_id = self.clients.get(&client_id).and_then(|client| {
+                    if let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode {
+                        Some(terminal_id.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(terminal_id) = direct_terminal_id {
+                    let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) else {
+                        return false;
+                    };
+                    if let Err(owner) = self.acquire_terminal_control(client_id, &real_terminal_id)
+                    {
+                        self.notify_terminal_control_blocked(client_id, owner);
+                        return false;
+                    }
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                         if let Err(err) = apply_terminal_attach_input(runtime, data) {
                             warn!(client_id, terminal_id = %terminal_id, err = %err);
                         }
@@ -4462,6 +4814,7 @@ impl HeadlessServer {
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
                 ClientConnectionMode::App => {
+                    self.activate_client_view(client_id);
                     let render_started = crate::render_prof::timer();
                     let render_cell_size =
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
@@ -4469,13 +4822,7 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
-                    let preserved_scroll = (!is_foreground).then_some((
-                        self.app.state.workspace_scroll,
-                        self.app.state.agent_panel_scroll,
-                        self.app.state.tab_scroll,
-                        self.app.state.mobile_switcher_scroll,
-                    ));
-                    let (buffer, cursor) =
+                    let (mut buffer, cursor) =
                         crate::server::render_stream::render_virtual_with_runtime_registry(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
@@ -4483,12 +4830,7 @@ impl HeadlessServer {
                             is_foreground,
                             render_cell_size,
                         );
-                    if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
-                        self.app.state.workspace_scroll = workspace;
-                        self.app.state.agent_panel_scroll = agent_panel;
-                        self.app.state.tab_scroll = tab;
-                        self.app.state.mobile_switcher_scroll = mobile_switcher;
-                    }
+                    self.overlay_collaboration_presence(client_id, &mut buffer, Instant::now());
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -4699,6 +5041,8 @@ impl HeadlessServer {
                 }
             }
         }
+
+        self.restore_foreground_client_view();
 
         if !broken_clients.is_empty() {
             for client_id in broken_clients {
@@ -5396,6 +5740,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            materialized_view_client_id: None,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -5405,6 +5750,7 @@ mod tests {
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
+            control_leases: ControlLeaseRegistry::new(Duration::from_secs(30)),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -6180,6 +6526,7 @@ mod tests {
             cell_width_px: 10,
             cell_height_px: 20,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: true,
@@ -6197,6 +6544,7 @@ mod tests {
             cell_width_px: 10,
             cell_height_px: 20,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6227,6 +6575,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6252,6 +6601,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6293,6 +6643,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6307,6 +6658,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6351,6 +6703,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6427,6 +6780,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6448,6 +6802,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6483,6 +6838,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -6549,6 +6905,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -6963,6 +7320,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6998,6 +7356,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -7032,6 +7391,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -7133,6 +7493,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -8751,6 +9112,196 @@ next_tab = ""
         )
     }
 
+    fn collaboration_test_client(
+        client_id: u64,
+        writer: ClientWriter,
+        view_state: ClientViewState,
+    ) -> ClientConnection {
+        let mut client = ClientConnection::new(
+            (100, 30),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            client_id,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        client.protocol_version = crate::protocol::COLLABORATION_PROTOCOL_VERSION;
+        client.presence = ParticipantPresence::anonymous(client_id);
+        client.view_state = Some(view_state);
+        client
+    }
+
+    #[tokio::test]
+    async fn collaboration_clients_render_independent_active_tabs() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("shared");
+        let first_pane = workspace.tabs[0].root_pane;
+        let second_tab = workspace.test_add_tab(Some("second"));
+        let second_pane = workspace.tabs[second_tab].root_pane;
+        workspace.tabs[0].runtimes.insert(
+            first_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"CLIENT-ONE-SURFACE"),
+        );
+        workspace.tabs[second_tab].runtimes.insert(
+            second_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"CLIENT-TWO-SURFACE"),
+        );
+        workspace.active_tab = 0;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let initial_view = ClientViewState::capture(&server.app.state);
+        let (first_writer, _first_control, first_render) = test_client_writer();
+        let (second_writer, _second_control, second_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            collaboration_test_client(1, first_writer, initial_view.clone()),
+        );
+        server
+            .clients
+            .insert(2, collaboration_test_client(2, second_writer, initial_view));
+        server.activate_client_view(1);
+        server.foreground_client_id = Some(1);
+
+        server.activate_client_view(2);
+        server.app.state.workspaces[0].active_tab = second_tab;
+        server.capture_materialized_client_view();
+        server.restore_foreground_client_view();
+        assert_eq!(server.app.state.workspaces[0].active_tab, 0);
+
+        server.render_and_stream();
+
+        let first_frame = read_server_frame(first_render.recv().expect("first client frame"));
+        let second_frame = read_server_frame(second_render.recv().expect("second client frame"));
+        let first_text = frame_text(&first_frame);
+        let second_text = frame_text(&second_frame);
+        assert!(first_text.contains("CLIENT-ONE-SURFACE"), "{first_text:?}");
+        assert!(!first_text.contains("CLIENT-TWO-SURFACE"), "{first_text:?}");
+        assert!(
+            second_text.contains("CLIENT-TWO-SURFACE"),
+            "{second_text:?}"
+        );
+        assert!(
+            !second_text.contains("CLIENT-ONE-SURFACE"),
+            "{second_text:?}"
+        );
+        assert_eq!(server.app.state.workspaces[0].active_tab, 0);
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn collaboration_overlay_shows_presence_pointer_and_control_owner() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("shared");
+        let pane_id = workspace.tabs[0].root_pane;
+        workspace.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"terminal"),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (mut buffer, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 100, 30),
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        let location = materialized_location(&server.app.state).expect("materialized location");
+        let pane_info = server.app.state.view.pane_infos[0].clone();
+        let initial_view = ClientViewState::capture(&server.app.state);
+        let (viewer_writer, _viewer_control, _viewer_render) = test_client_writer();
+        let (alice_writer, _alice_control, _alice_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            collaboration_test_client(1, viewer_writer, initial_view.clone()),
+        );
+        let mut alice = collaboration_test_client(2, alice_writer, initial_view);
+        alice.presence.display_name = "Alice".into();
+        alice.presence.location = Some(location.clone());
+        alice.presence.pointer = Some(crate::server::collaboration::GhostPointer {
+            pane_id,
+            column: 2,
+            row: 1,
+            updated_at: Instant::now(),
+        });
+        server.clients.insert(2, alice);
+        assert!(matches!(
+            server
+                .control_leases
+                .acquire(&location.terminal_id, 2, Instant::now()),
+            LeaseAcquire::Acquired
+        ));
+
+        server.overlay_collaboration_presence(1, &mut buffer, Instant::now());
+
+        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        let text = frame_text(&frame);
+        assert!(text.contains("Alice also here"), "{text:?}");
+        assert!(text.contains("Alice controls"), "{text:?}");
+        assert_eq!(
+            buffer[(pane_info.inner_rect.x + 2, pane_info.inner_rect.y + 1)].symbol(),
+            "◆"
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn collaboration_control_lease_blocks_a_second_terminal_writer() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"");
+        let initial_view = ClientViewState::capture(&server.app.state);
+        let (first_writer, _first_control, _first_render) = test_client_writer();
+        let (second_writer, _second_control, _second_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            collaboration_test_client(1, first_writer, initial_view.clone()),
+        );
+        server
+            .clients
+            .insert(2, collaboration_test_client(2, second_writer, initial_view));
+        server.activate_client_view(1);
+        server.foreground_client_id = Some(1);
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::TextCommit("a".into())],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("first writer input"),
+            Bytes::from_static(b"a")
+        );
+        let terminal_id = materialized_location(&server.app.state)
+            .expect("focused terminal")
+            .terminal_id;
+        assert_eq!(
+            server.control_leases.owner(&terminal_id, Instant::now()),
+            Some(1)
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::TextCommit("b".into())],
+        }));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "second writer reached the pane"
+        );
+        assert_eq!(
+            server.control_leases.owner(&terminal_id, Instant::now()),
+            Some(1)
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
     #[test]
     fn foreground_client_focus_event_updates_app_focus_state() {
         let mut server = test_headless_server();
@@ -9184,6 +9735,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,

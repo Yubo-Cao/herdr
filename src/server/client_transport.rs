@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
-    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, COLLABORATION_PROTOCOL_VERSION,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -308,6 +308,7 @@ pub(crate) enum ServerEvent {
     /// A new client completed the handshake.
     ClientConnected {
         client_id: u64,
+        protocol_version: u32,
         cols: u16,
         rows: u16,
         cell_width_px: u32,
@@ -317,6 +318,11 @@ pub(crate) enum ServerEvent {
         direct_attach_requested: bool,
         direct_graphics: bool,
         writer: ClientWriter,
+    },
+    /// A collaboration-aware client supplied a display label.
+    ClientCollaborationIdentity {
+        client_id: u64,
+        display_name: String,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
@@ -563,6 +569,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        client_protocol_version,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -575,7 +582,7 @@ pub(crate) fn handle_client_handshake(
             launch_mode,
         } => {
             // Version check.
-            match protocol::check_client_version(version) {
+            match protocol::check_client_protocol(version) {
                 protocol::VersionCheck::Compatible => {}
                 protocol::VersionCheck::Incompatible(reason) => {
                     // Send rejection Welcome.
@@ -613,6 +620,7 @@ pub(crate) fn handle_client_handshake(
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
+                version,
             )
         }
         _ => {
@@ -634,7 +642,7 @@ pub(crate) fn handle_client_handshake(
 
     // Send Welcome.
     let welcome = ServerMessage::Welcome {
-        version: PROTOCOL_VERSION,
+        version: client_protocol_version,
         encoding: render_encoding,
         error: None,
     };
@@ -669,6 +677,7 @@ pub(crate) fn handle_client_handshake(
     // Notify the main loop about the new client.
     let connected = ServerEvent::ClientConnected {
         client_id,
+        protocol_version: client_protocol_version,
         cols: client_cols,
         rows: client_rows,
         cell_width_px,
@@ -686,7 +695,13 @@ pub(crate) fn handle_client_handshake(
     }
 
     // Enter read loop — read client messages and forward to main loop.
-    client_read_loop(stream, client_id, server_event_tx, should_quit)
+    client_read_loop(
+        stream,
+        client_id,
+        client_protocol_version,
+        server_event_tx,
+        should_quit,
+    )
 }
 
 fn send_shutdown_to_unregistered_client(writer: &ClientWriter) {
@@ -744,6 +759,7 @@ fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
 fn client_read_loop(
     mut stream: LocalStream,
     client_id: u64,
+    protocol_version: u32,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -912,6 +928,21 @@ fn client_read_loop(
                 transfer_id,
                 image_id,
             },
+            ClientMessage::CollaborationIdentity { display_name } => {
+                if protocol_version != COLLABORATION_PROTOCOL_VERSION {
+                    warn!(
+                        client_id,
+                        protocol_version, "legacy client sent collaboration-only message, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ClientCollaborationIdentity {
+                    client_id,
+                    display_name,
+                }
+            }
             ClientMessage::ClipboardImage { extension, data } => {
                 if data.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
                     warn!(
@@ -1360,6 +1391,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px,
                 cell_height_px,
                 render_encoding,
+                protocol_version,
                 keybindings,
                 direct_attach_requested,
                 direct_graphics,
@@ -1369,6 +1401,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
                 assert!(!direct_graphics);
@@ -1456,7 +1489,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         protocol::write_message(
@@ -1531,7 +1570,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         protocol::write_message(
@@ -1563,7 +1608,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         protocol::write_message(
@@ -1598,7 +1649,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         protocol::write_message(
@@ -1633,7 +1690,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
         let mut data = bracketed_paste_with_total_len(MAX_INPUT_PAYLOAD + 1);
         data[b"\x1b[200~".len()] = 0xff;
@@ -1661,7 +1724,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
         let events = vec![
             ClientInputEvent::Key {
@@ -1707,6 +1776,85 @@ new_tab = "ctrl+notakey"
     }
 
     #[test]
+    fn collaboration_identity_is_forwarded_for_collaboration_protocol() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-collaboration-identity");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(
+                server_stream,
+                7,
+                protocol::COLLABORATION_PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::CollaborationIdentity {
+                display_name: "Alice".into(),
+            },
+        )
+        .expect("write collaboration identity");
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "collaboration identity"),
+            ServerEvent::ClientCollaborationIdentity {
+                client_id: 7,
+                display_name
+            } if display_name == "Alice"
+        ));
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn legacy_protocol_rejects_collaboration_only_messages() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-legacy-collaboration-identity");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::CollaborationIdentity {
+                display_name: "Alice".into(),
+            },
+        )
+        .expect("write collaboration identity on legacy protocol");
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "legacy protocol disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
     fn client_read_loop_rejects_oversized_input_event_batch() {
         let (mut client_stream, server_stream, _path) =
             local_stream_pair("client-read-oversized-events");
@@ -1714,7 +1862,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         protocol::write_message(
@@ -1749,7 +1903,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                PROTOCOL_VERSION,
+                &server_event_tx,
+                &read_quit,
+            )
         });
 
         let maximum = vec![

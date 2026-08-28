@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::protocol::RenderEncoding;
 use crate::server::client_transport::ClientWriter;
+use crate::server::collaboration::{ClientViewState, ParticipantPresence};
 use crate::server::render_stream::ClientRenderState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub(crate) enum DeferredRender {
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
+    /// Negotiated private TUI protocol version for this connection.
+    pub(crate) protocol_version: u32,
     /// Whether this connection is the full app client or a direct terminal attach.
     pub(crate) mode: ClientConnectionMode,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
@@ -51,6 +54,10 @@ pub(crate) struct ClientConnection {
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
     pub(crate) last_activity: u64,
+    /// Client-local presentation projection when another client is materialized.
+    pub(crate) view_state: Option<ClientViewState>,
+    /// Ephemeral collaboration identity and location.
+    pub(crate) presence: ParticipantPresence,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
@@ -113,6 +120,7 @@ impl ClientConnection {
         writer: Option<ClientWriter>,
     ) -> Self {
         Self {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             mode,
             pending_terminal_attach,
             keybindings,
@@ -126,6 +134,8 @@ impl ClientConnection {
             outer_terminal_focus,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
+            view_state: None,
+            presence: ParticipantPresence::anonymous(0),
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             direct_graphics: false,

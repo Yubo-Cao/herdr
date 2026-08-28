@@ -28,6 +28,65 @@ fn is_modifier_only_key(code: &KeyCode) -> bool {
 }
 
 impl App {
+    /// Returns the terminal that a headless client event is expected to write to.
+    ///
+    /// This is deliberately a read-only preflight used by the collaboration
+    /// server's control leases. Herdr navigation keys and the prefix key return
+    /// `None`, so another participant can keep navigating while a pane is owned.
+    pub(crate) fn collaboration_terminal_target(
+        &self,
+        event: &crate::raw_input::RawInputEvent,
+    ) -> Option<crate::terminal::TerminalId> {
+        // Popup panes are private, short-lived modal interactions rather than a
+        // shared workspace pane, so they do not participate in pane leases.
+        if self.state.popup_pane.is_some() || self.state.mode != Mode::Terminal {
+            return None;
+        }
+
+        let ws_idx = self.state.active?;
+        let workspace = self.state.workspaces.get(ws_idx)?;
+        let pane_id = workspace.focused_pane_id()?;
+        let terminal_id = workspace.terminal_id(pane_id)?.clone();
+
+        match event {
+            crate::raw_input::RawInputEvent::Text(text) if !text.as_str().is_empty() => {
+                Some(terminal_id)
+            }
+            crate::raw_input::RawInputEvent::Paste(_) => Some(terminal_id),
+            crate::raw_input::RawInputEvent::Key(key) => {
+                if super::terminal_direct_non_indexed_navigation_action(&self.state, key).is_some()
+                    || super::navigate::command_for_key(
+                        &self.state,
+                        key,
+                        super::navigate::BindingDispatch::Direct,
+                    )
+                    .is_some()
+                    || super::terminal_direct_indexed_navigation_action(&self.state, key).is_some()
+                    || self.state.is_prefix_key(key)
+                    || is_modifier_only_key(&key.code)
+                {
+                    return None;
+                }
+
+                let key_event = key.as_key_event();
+                if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                    && key_event.modifiers.is_empty()
+                {
+                    let uses_host_scrollback = self
+                        .state
+                        .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                        .and_then(|runtime| runtime.plain_page_keys_use_host_scrollback())
+                        .unwrap_or(false);
+                    if uses_host_scrollback {
+                        return None;
+                    }
+                }
+                Some(terminal_id)
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn handle_terminal_key_headless(
         &mut self,

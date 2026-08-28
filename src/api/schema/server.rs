@@ -18,4 +18,7 @@ pub struct ServerCapabilities {
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,
+    /// Optional private TUI protocol level for collaboration-aware clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_protocol: Option<u32>,
 }

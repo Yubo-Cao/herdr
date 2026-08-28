@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version. Bumped when wire format changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 21;
 
+/// Optional protocol level for collaboration-aware clients.
+///
+/// `PROTOCOL_VERSION` remains the compatibility floor advertised by the JSON
+/// status API so stock Herdr clients can attach. Collaboration-aware clients
+/// use this version only when the server advertises the matching capability.
+pub const COLLABORATION_PROTOCOL_VERSION: u32 = 22;
+
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
@@ -449,6 +456,12 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// Optional display identity for collaboration presence.
+    ///
+    /// This variant is appended to preserve every legacy wire tag and is valid
+    /// only after a collaboration-protocol handshake.
+    CollaborationIdentity { display_name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1020,6 +1033,19 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
     }
 }
 
+/// Checks a client protocol for the private TUI socket.
+///
+/// The legacy protocol and the separately advertised collaboration protocol
+/// are both accepted by collaboration-aware servers. Other versions retain
+/// the existing strict compatibility behavior.
+pub fn check_client_protocol(client_version: u32) -> VersionCheck {
+    if client_version == COLLABORATION_PROTOCOL_VERSION {
+        VersionCheck::Compatible
+    } else {
+        check_client_version(client_version)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1132,6 +1158,32 @@ mod tests {
             }),
             9
         );
+        assert_eq!(
+            tag(&ClientMessage::CollaborationIdentity {
+                display_name: "alice".to_owned(),
+            }),
+            13
+        );
+    }
+
+    #[test]
+    fn collaboration_protocol_accepts_legacy_and_collaboration_versions() {
+        assert_eq!(
+            check_client_protocol(PROTOCOL_VERSION),
+            VersionCheck::Compatible
+        );
+        assert_eq!(
+            check_client_protocol(COLLABORATION_PROTOCOL_VERSION),
+            VersionCheck::Compatible
+        );
+        assert!(matches!(
+            check_client_protocol(PROTOCOL_VERSION - 1),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(
+            check_client_protocol(COLLABORATION_PROTOCOL_VERSION + 1),
+            VersionCheck::Incompatible(_)
+        ));
     }
 
     #[test]

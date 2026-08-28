@@ -13,6 +13,16 @@ Detach the client with `ctrl+b q`; panes and agents keep running. Reattach by ru
 
 When Herdr starts again after a full server stop, it restores the saved session shape. For what survives detach, server restart, screen history replay, native agent session restore, and live handoff, see [Session state and restore](/docs/session-state/).
 
+## Collaborate in one session
+
+Multiple full Herdr clients can attach to the same session at once. Pane processes and terminal output are shared, while each client keeps its own active workspace and tab, pane focus, zoom, and modal state. Navigation on one screen does not move the other screens.
+
+Clients that negotiate the collaboration extension show participant labels and short-lived, pane-relative ghost pointers. Set `HERDR_COLLAB_NAME` before attaching to choose the label; otherwise Herdr uses `USER` or `USERNAME`. The first collaborating client to send input to a pane owns its control lease until 30 seconds of inactivity or disconnect. Navigation stays local and does not take a lease. Direct terminal attach keeps its existing observer and `--takeover` behavior.
+
+Negotiation is automatic. A collaboration client silently falls back when it reaches an older server, and a traditional client can attach to a collaboration server without understanding presence or leases. Mixed legacy clients retain their traditional unrestricted input behavior.
+
+The local Unix socket remains private to one OS account. People connecting through separate terminals or SSH sessions must use the account that owns the Herdr server; sharing a session across separate Unix accounts still needs an external relay or a different socket-permission model. Pane terminal state, including scrollback, is also still shared even though full-client navigation is independent.
+
 ## Named sessions
 
 Use named sessions when you want independent Herdr servers.

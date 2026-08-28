@@ -315,6 +315,7 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         cell_width_px: 10,
         cell_height_px: 20,
         render_encoding: RenderEncoding::SemanticFrame,
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         keybindings: None,
         direct_attach_requested: false,
         direct_graphics: true,

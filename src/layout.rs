@@ -91,6 +91,13 @@ pub struct TileLayout {
     prev_focus: Option<PaneId>,
 }
 
+/// Client-local focus projection for a shared tile tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TileFocusState {
+    pub focus: PaneId,
+    pub previous: Option<PaneId>,
+}
+
 impl TileLayout {
     /// Create a new layout with a single pane (globally unique ID).
     /// Returns (layout, root_pane_id) so the caller can create the pane.
@@ -116,6 +123,23 @@ impl TileLayout {
 
     pub fn focused(&self) -> PaneId {
         self.focus
+    }
+
+    pub(crate) fn focus_state(&self) -> TileFocusState {
+        TileFocusState {
+            focus: self.focus,
+            previous: self.prev_focus,
+        }
+    }
+
+    pub(crate) fn restore_focus_state(&mut self, state: TileFocusState) {
+        let pane_ids = self.pane_ids();
+        if pane_ids.contains(&state.focus) {
+            self.focus = state.focus;
+        }
+        self.prev_focus = state
+            .previous
+            .filter(|id| *id != self.focus && pane_ids.contains(id));
     }
 
     pub fn pane_count(&self) -> usize {

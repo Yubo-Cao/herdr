@@ -867,6 +867,7 @@ pub enum ViewLayout {
     Mobile,
 }
 
+#[derive(Clone)]
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
@@ -1178,6 +1179,7 @@ pub struct ThemeRuntimeConfig {
     pub legacy_accent: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct SettingsState {
     /// Which section tab is active.
     pub section: SettingsSection,
@@ -1195,6 +1197,7 @@ pub(crate) enum WorkspaceDropTarget {
     End,
 }
 
+#[derive(Clone)]
 pub(crate) enum DragTarget {
     WorkspaceReorder {
         source_id: crate::app::InputSourceId,
@@ -1237,6 +1240,7 @@ pub(crate) enum DragTarget {
 }
 
 /// Active mouse drag on a split border or sidebar divider.
+#[derive(Clone)]
 pub(crate) struct DragState {
     pub target: DragTarget,
 }
@@ -1280,6 +1284,7 @@ pub enum ContextMenuKind {
 }
 
 /// Right-click context menu state.
+#[derive(Clone)]
 pub struct ContextMenuState {
     pub kind: ContextMenuKind,
     pub x: u16,
@@ -1389,6 +1394,7 @@ pub struct CopyFeedback {
     pub message: String,
 }
 
+#[derive(Clone)]
 pub struct ReleaseNotesState {
     pub version: String,
     pub body: String,
@@ -1396,6 +1402,7 @@ pub struct ReleaseNotesState {
     pub preview: bool,
 }
 
+#[derive(Clone)]
 pub struct ProductAnnouncementState {
     pub version: String,
     pub id: String,
@@ -1405,7 +1412,7 @@ pub struct ProductAnnouncementState {
     pub preview: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeybindHelpState {
     pub scroll: u16,
     pub query: String,

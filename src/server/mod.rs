@@ -5,6 +5,7 @@ pub(crate) mod client_accept;
 pub(crate) mod client_transport;
 pub(crate) mod clients;
 pub(crate) mod clipboard_image;
+pub(crate) mod collaboration;
 #[cfg(unix)]
 pub(crate) mod handoff;
 pub mod headless;
