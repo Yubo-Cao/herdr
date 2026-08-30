@@ -1026,6 +1026,14 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.config_reload");
         }
 
+        if self.app.state.request_takeover_focused_pane {
+            self.app.state.request_takeover_focused_pane = false;
+            if let Some(client_id) = self.foreground_client_id {
+                needs_render |= self.takeover_focused_pane_from_tui(client_id);
+            }
+            crate::render_prof::event("full_render_cause.pane_control_takeover");
+        }
+
         needs_render
     }
 
@@ -1299,6 +1307,11 @@ impl HeadlessServer {
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
         );
+        let collaboration = self
+            .app
+            .state
+            .collaboration
+            .snapshot(crate::collaboration::unix_ms());
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
@@ -1328,6 +1341,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            Some(collaboration),
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1599,6 +1613,168 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
+    fn tui_participant_id(client_id: u64) -> String {
+        format!("tui:{client_id}")
+    }
+
+    fn tui_collaboration_params(
+        &self,
+        client_id: u64,
+        typing: bool,
+    ) -> api::schema::CollaborationUpdateParams {
+        let (workspace_id, tab_id, pane_id) = self
+            .app
+            .state
+            .active
+            .and_then(|ws_idx| {
+                let workspace = self.app.state.workspaces.get(ws_idx)?;
+                let tab_idx = workspace.active_tab_index();
+                let pane_id = workspace.focused_pane_id()?;
+                let tab_number = workspace.public_tab_number(tab_idx)?;
+                let pane_number = workspace.public_pane_number(pane_id)?;
+                Some((
+                    Some(workspace.id.clone()),
+                    Some(crate::workspace::public_tab_id_for_number(
+                        &workspace.id,
+                        tab_number,
+                    )),
+                    Some(crate::workspace::public_pane_id_for_number(
+                        &workspace.id,
+                        pane_number,
+                    )),
+                ))
+            })
+            .unwrap_or((None, None, None));
+        api::schema::CollaborationUpdateParams {
+            participant_id: Self::tui_participant_id(client_id),
+            display_name: format!("Herdr TUI {client_id}"),
+            color: "#8250df".to_owned(),
+            role: api::schema::CollaborationRole::Editor,
+            activity: api::schema::CollaborationActivity::Active,
+            surface: "tui".to_owned(),
+            workspace_id,
+            tab_id,
+            pane_id,
+            typing,
+        }
+    }
+
+    fn sync_tui_collaboration_presence(
+        &mut self,
+        client_id: u64,
+        now: u64,
+        force: bool,
+        typing: bool,
+    ) {
+        if self
+            .clients
+            .get(&client_id)
+            .is_none_or(|client| !client.is_full_app_client() || client.writer.is_none())
+        {
+            return;
+        }
+        let participant_id = Self::tui_participant_id(client_id);
+        if !force
+            && !self
+                .app
+                .state
+                .collaboration
+                .participant_needs_refresh(&participant_id, now)
+        {
+            return;
+        }
+        let params = self.tui_collaboration_params(client_id, typing);
+        self.app.state.collaboration.update_participant(params, now);
+        let snapshot = self.app.state.collaboration.snapshot(now);
+        self.app.emit_collaboration_updated(snapshot);
+    }
+
+    fn sync_all_tui_collaboration_presence(&mut self, now: u64) {
+        let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
+        for client_id in client_ids {
+            self.sync_tui_collaboration_presence(client_id, now, false, false);
+        }
+    }
+
+    fn takeover_focused_pane_from_tui(&mut self, client_id: u64) -> bool {
+        if self
+            .clients
+            .get(&client_id)
+            .is_none_or(|client| !client.is_full_app_client())
+        {
+            return false;
+        }
+        let Some(ws_idx) = self.app.state.active else {
+            return false;
+        };
+        let Some(workspace) = self.app.state.workspaces.get(ws_idx) else {
+            return false;
+        };
+        let Some(pane_id) = workspace.focused_pane_id() else {
+            return false;
+        };
+        let Some(terminal_id) = workspace.terminal_id(pane_id).cloned() else {
+            return false;
+        };
+        let Some(pane_number) = workspace.public_pane_number(pane_id) else {
+            return false;
+        };
+        let public_pane_id =
+            crate::workspace::public_pane_id_for_number(&workspace.id, pane_number);
+        let terminal_id_string = terminal_id.to_string();
+        let now = crate::collaboration::unix_ms();
+        self.sync_tui_collaboration_presence(client_id, now, true, false);
+        let participant_id = Self::tui_participant_id(client_id);
+        let claim_granted = self
+            .app
+            .state
+            .collaboration
+            .claim_pane(&participant_id, &public_pane_id, true, Some(15_000), now)
+            .is_ok_and(|(granted, _)| granted);
+        if !claim_granted {
+            return false;
+        }
+        let snapshot = self.app.state.collaboration.snapshot(now);
+        self.app.emit_collaboration_updated(snapshot);
+
+        if let Some(owner_id) = self
+            .terminal_attach_owners
+            .get(&terminal_id_string)
+            .copied()
+        {
+            self.send_to_client(
+                owner_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some("pane control taken over by Herdr TUI".to_owned()),
+                },
+            );
+            self.remove_client_and_resize_if_needed(owner_id);
+        } else {
+            self.app
+                .state
+                .direct_attach_resize_locks
+                .remove(&terminal_id);
+        }
+
+        self.promote_client_to_foreground(client_id);
+        self.resize_shared_runtime_to_effective_size();
+        #[cfg(unix)]
+        if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+            runtime.nudge_child_redraw_after_handoff();
+        }
+
+        let previous_toast = self.app.state.toast.clone();
+        self.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pane control taken".to_owned(),
+            context: public_pane_id,
+            position: None,
+            target: None,
+        });
+        self.app.sync_toast_deadline(previous_toast);
+        true
+    }
+
     fn remove_client(&mut self, client_id: u64) -> bool {
         self.retire_direct_graphics_for_client(client_id);
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -1606,6 +1782,18 @@ impl HeadlessServer {
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
+            if removed.is_full_app_client() {
+                let collaboration_changed = self
+                    .app
+                    .state
+                    .collaboration
+                    .leave(&Self::tui_participant_id(client_id));
+                if collaboration_changed {
+                    let now = crate::collaboration::unix_ms();
+                    let snapshot = self.app.state.collaboration.snapshot(now);
+                    self.app.emit_collaboration_updated(snapshot);
+                }
+            }
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
@@ -2892,6 +3080,7 @@ impl HeadlessServer {
         }
 
         info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal attach client connected");
+        self.app.release_terminal_input_headless(&real_terminal_id);
         self.terminal_attach_owners
             .insert(terminal_id.clone(), client_id);
         self.app
@@ -2953,6 +3142,8 @@ impl HeadlessServer {
         }
         let events = events_for_app_routing(events, source_was_foreground, source_is_full_app);
         let interaction = events_include_interaction(&events);
+        let typing = self.app.state.mode == crate::app::Mode::Terminal
+            && events_include_typing_input(&events);
         let foreground_changed = if interaction {
             self.promote_client_to_foreground(client_id)
         } else {
@@ -2965,6 +3156,14 @@ impl HeadlessServer {
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
         self.app.route_client_events_from(client_id, events, false);
+        if source_is_full_app {
+            self.sync_tui_collaboration_presence(
+                client_id,
+                crate::collaboration::unix_ms(),
+                true,
+                typing,
+            );
+        }
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
@@ -3061,6 +3260,12 @@ impl HeadlessServer {
                 }
                 self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
+                self.sync_tui_collaboration_presence(
+                    client_id,
+                    crate::collaboration::unix_ms(),
+                    true,
+                    false,
+                );
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
             }
@@ -3079,7 +3284,12 @@ impl HeadlessServer {
                 client_id,
                 terminal_id,
                 takeover,
-            } => self.attach_terminal_client(client_id, terminal_id, takeover),
+            } => {
+                // AttachTerminal predates collaborative observe/control roles. Preserve the
+                // legacy contract for older clients: asking to attach is an implicit takeover.
+                let _legacy_takeover_flag = takeover;
+                self.attach_terminal_client(client_id, terminal_id, true)
+            }
             ServerEvent::ClientObserveTerminal { client_id, target } => {
                 self.observe_terminal_client(client_id, target)
             }
@@ -3138,11 +3348,24 @@ impl HeadlessServer {
                     return false;
                 }
                 debug!(client_id, len = data.len(), "client input received");
-                if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
-                {
+                if let Some(ClientConnection { mode, .. }) = self.clients.get(&client_id) {
+                    let terminal_id = match mode {
+                        ClientConnectionMode::TerminalAttach { terminal_id }
+                        | ClientConnectionMode::TerminalObserve { terminal_id } => terminal_id,
+                        ClientConnectionMode::App => {
+                            let events = if let Some(client) = self.clients.get_mut(&client_id) {
+                                let mut events = client.raw_input.push(&data);
+                                // The thin client only forwards a bare ESC after its local input timeout.
+                                if data.as_slice() == b"\x1b" {
+                                    events.extend(client.raw_input.flush_timeout());
+                                }
+                                events
+                            } else {
+                                Vec::new()
+                            };
+                            return self.handle_client_input_events(client_id, events);
+                        }
+                    };
                     if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                         if let Err(err) = apply_terminal_attach_input(runtime, data) {
                             warn!(client_id, terminal_id = %terminal_id, err = %err);
@@ -3150,23 +3373,7 @@ impl HeadlessServer {
                     }
                     return true;
                 }
-                if matches!(
-                    self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
-                ) {
-                    return false;
-                }
-                let events = if let Some(client) = self.clients.get_mut(&client_id) {
-                    let mut events = client.raw_input.push(&data);
-                    // The thin client only forwards a bare ESC after its local input timeout.
-                    if data.as_slice() == b"\x1b" {
-                        events.extend(client.raw_input.flush_timeout());
-                    }
-                    events
-                } else {
-                    Vec::new()
-                };
-                self.handle_client_input_events(client_id, events)
+                false
             }
             ServerEvent::ClientInputEvents { client_id, events } => {
                 if self.handoff_in_progress {
@@ -4720,6 +4927,18 @@ impl HeadlessServer {
     /// (the server doesn't have a terminal to resize).
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
+        let collaboration_now = crate::collaboration::unix_ms();
+        self.sync_all_tui_collaboration_presence(collaboration_now);
+        let collaboration_changed = self
+            .app
+            .state
+            .collaboration
+            .prune_expired(collaboration_now);
+        if collaboration_changed {
+            let snapshot = self.app.state.collaboration.snapshot(collaboration_now);
+            self.app.emit_collaboration_updated(snapshot);
+            changed = true;
+        }
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
@@ -4928,6 +5147,18 @@ fn events_are_render_neutral_mouse_motion(
                 })
             )
         })
+}
+
+fn events_include_typing_input(events: &[crate::raw_input::RawInputEvent]) -> bool {
+    events.iter().any(|event| match event {
+        crate::raw_input::RawInputEvent::Key(key) => {
+            key.kind != crossterm::event::KeyEventKind::Release
+                && !matches!(key.code, crossterm::event::KeyCode::Modifier(_))
+        }
+        crate::raw_input::RawInputEvent::Text(_) => true,
+        crate::raw_input::RawInputEvent::Paste(text) => !text.is_empty(),
+        _ => false,
+    })
 }
 
 fn events_for_app_routing(
@@ -5179,6 +5410,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
+    let collaboration = received.manifest.collaboration.take();
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
@@ -5209,6 +5441,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             event_hub.clone(),
             &received.manifest.snapshot,
             &mut imports,
+            collaboration,
         )?;
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
@@ -6658,6 +6891,43 @@ next_tab = ""
     }
 
     #[test]
+    fn terminal_observe_clients_can_share_terminal_input_without_resize_ownership() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            server
+                .app
+                .terminal_runtimes
+                .insert(terminal_id.clone(), runtime);
+            connect_pending_terminal_client(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                    client_id: 7,
+                    target: terminal_id_string,
+                })
+            );
+
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 7,
+                data: b"shared".to_vec(),
+            }));
+            assert_eq!(
+                input_rx.try_recv().expect("shared observer input"),
+                Bytes::from_static(b"shared")
+            );
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size(),
+                (24, 80)
+            );
+        });
+    }
+
+    #[test]
     fn terminal_observe_resolves_public_pane_id() {
         with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
             connect_pending_terminal_client(server, 7);
@@ -6857,6 +7127,95 @@ next_tab = ""
     }
 
     #[test]
+    fn tui_takeover_disconnects_controller_and_keeps_observers() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                let (app_writer, _app_control_rx, _app_render_rx) = test_client_writer();
+                server.clients.insert(
+                    1,
+                    ClientConnection::new(
+                        (120, 40),
+                        crate::kitty_graphics::HostCellSize::default(),
+                        crate::terminal_theme::TerminalTheme::default(),
+                        Some(true),
+                        1,
+                        RenderEncoding::SemanticFrame,
+                        Some(app_writer),
+                    ),
+                );
+                server.app.state.active = Some(0);
+                server.app.state.selected = 0;
+                server.app.state.mode = crate::app::Mode::Terminal;
+                server.foreground_client_id = Some(1);
+                server.sync_foreground_client_state();
+                server.resize_shared_runtime_to_effective_size();
+
+                let controller_control_rx =
+                    connect_pending_terminal_client_with_control_rx(server, 7);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientControlTerminal {
+                        client_id: 7,
+                        target: terminal_id_string.clone(),
+                        takeover: false,
+                    })
+                );
+                connect_pending_terminal_client(server, 8);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                        client_id: 8,
+                        target: terminal_id_string.clone(),
+                    })
+                );
+
+                assert!(server
+                    .app
+                    .state
+                    .direct_attach_resize_locks
+                    .contains(&terminal_id));
+                assert!(server.takeover_focused_pane_from_tui(1));
+
+                assert!(server.clients.contains_key(&1));
+                assert!(!server.clients.contains_key(&7));
+                assert!(matches!(
+                    server.clients.get(&8).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalObserve { terminal_id })
+                        if terminal_id == &terminal_id_string
+                ));
+                assert!(!server
+                    .terminal_attach_owners
+                    .contains_key(&terminal_id_string));
+                assert!(!server
+                    .app
+                    .state
+                    .direct_attach_resize_locks
+                    .contains(&terminal_id));
+                assert_eq!(server.foreground_client_id, Some(1));
+
+                let reason = read_server_shutdown_reason(
+                    controller_control_rx.recv().expect("controller shutdown"),
+                );
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("pane control taken over by Herdr TUI")
+                );
+
+                let snapshot = server
+                    .app
+                    .state
+                    .collaboration
+                    .snapshot(crate::collaboration::unix_ms());
+                assert!(snapshot.participants.iter().any(|participant| {
+                    participant.participant_id == "tui:1"
+                        && participant.pane_id.as_deref() == Some(public_pane_id.as_str())
+                }));
+                assert!(snapshot.pane_claims.iter().any(|claim| {
+                    claim.pane_id == public_pane_id && claim.participant_id == "tui:1"
+                }));
+            },
+        );
+    }
+
+    #[test]
     fn terminal_control_detach_sends_shutdown_before_removal() {
         with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
             let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
@@ -6904,6 +7263,39 @@ next_tab = ""
                 .state
                 .direct_attach_resize_locks
                 .contains(&terminal_id));
+        });
+    }
+
+    #[test]
+    fn legacy_terminal_attach_takes_over_existing_controller_by_default() {
+        with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
+            let controller_control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            connect_pending_terminal_client(server, 8);
+
+            assert!(
+                server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                    client_id: 8,
+                    terminal_id: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+
+            assert!(!server.clients.contains_key(&7));
+            assert_eq!(
+                server.terminal_attach_owners.get(&terminal_id_string),
+                Some(&8)
+            );
+            let reason = read_server_shutdown_reason(
+                controller_control_rx.recv().expect("controller shutdown"),
+            );
+            assert_eq!(reason.as_deref(), Some("terminal attach taken over"));
         });
     }
 
@@ -7765,6 +8157,28 @@ next_tab = ""
                 shape: cursor.as_ref().map(|c| c.shape).unwrap_or(0),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn virtual_render_hides_cursor_for_remotely_controlled_pane() {
+        let mut state = AppState::test_new();
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.terminal_id(pane_id).unwrap().clone();
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left"),
+        );
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+        state.direct_attach_resize_locks.insert(terminal_id);
+
+        let (_buffer, cursor) =
+            crate::server::render_stream::render_virtual(&mut state, Rect::new(0, 0, 80, 24), true);
+
+        assert_eq!(cursor, None);
     }
 
     #[tokio::test]
@@ -8715,6 +9129,30 @@ next_tab = ""
         ] {
             assert!(!events_are_render_neutral_mouse_motion(&events, mode));
         }
+    }
+
+    #[test]
+    fn typing_presence_ignores_mouse_and_key_release_events() {
+        let press = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        let release = crate::raw_input::RawInputEvent::Key(
+            crate::input::TerminalKey::new(
+                crossterm::event::KeyCode::Char('x'),
+                KeyModifiers::empty(),
+            )
+            .with_kind(crossterm::event::KeyEventKind::Release),
+        );
+        let mouse = crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(events_include_typing_input(&[press]));
+        assert!(!events_include_typing_input(&[release, mouse]));
     }
 
     fn install_focused_test_runtime(

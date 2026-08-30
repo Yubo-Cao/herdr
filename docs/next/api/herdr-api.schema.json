@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 21,
+  "protocol": 20,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -78,6 +78,162 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "CollaborationActivity": {
+          "enum": [
+            "active",
+            "idle",
+            "away"
+          ],
+          "type": "string"
+        },
+        "CollaborationPaneClaim": {
+          "properties": {
+            "acquired_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "protected_until_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "updated_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "participant_id",
+            "acquired_at_unix_ms",
+            "updated_at_unix_ms",
+            "expires_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "CollaborationParticipant": {
+          "properties": {
+            "activity": {
+              "$ref": "#/schemas/event/$defs/CollaborationActivity"
+            },
+            "color": {
+              "type": "string"
+            },
+            "display_name": {
+              "type": "string"
+            },
+            "expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/schemas/event/$defs/CollaborationRole"
+            },
+            "surface": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "typing": {
+              "type": "boolean"
+            },
+            "typing_expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "updated_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "participant_id",
+            "display_name",
+            "color",
+            "role",
+            "activity",
+            "surface",
+            "updated_at_unix_ms",
+            "expires_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "CollaborationRole": {
+          "enum": [
+            "owner",
+            "editor",
+            "viewer"
+          ],
+          "type": "string"
+        },
+        "CollaborationSnapshot": {
+          "properties": {
+            "lease_ttl_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_claims": {
+              "items": {
+                "$ref": "#/schemas/event/$defs/CollaborationPaneClaim"
+              },
+              "type": "array"
+            },
+            "participants": {
+              "items": {
+                "$ref": "#/schemas/event/$defs/CollaborationParticipant"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "participants",
+            "pane_claims",
+            "lease_ttl_ms"
+          ],
+          "type": "object"
         },
         "EventData": {
           "oneOf": [
@@ -723,6 +879,22 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "snapshot": {
+                  "$ref": "#/schemas/event/$defs/CollaborationSnapshot"
+                },
+                "type": {
+                  "const": "collaboration_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -753,7 +925,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "collaboration_updated"
           ],
           "type": "string"
         },
@@ -1697,6 +1870,128 @@
           },
           "required": [
             "title"
+          ],
+          "type": "object"
+        },
+        "CollaborationActivity": {
+          "enum": [
+            "active",
+            "idle",
+            "away"
+          ],
+          "type": "string"
+        },
+        "CollaborationClaimParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "protect_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "takeover": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "participant_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "CollaborationLeaveParams": {
+          "properties": {
+            "participant_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "participant_id"
+          ],
+          "type": "object"
+        },
+        "CollaborationReleaseParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "participant_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "participant_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "CollaborationRole": {
+          "enum": [
+            "owner",
+            "editor",
+            "viewer"
+          ],
+          "type": "string"
+        },
+        "CollaborationUpdateParams": {
+          "properties": {
+            "activity": {
+              "$ref": "#/schemas/request/$defs/CollaborationActivity",
+              "default": "active"
+            },
+            "color": {
+              "type": "string"
+            },
+            "display_name": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/schemas/request/$defs/CollaborationRole",
+              "default": "editor"
+            },
+            "surface": {
+              "default": "api",
+              "type": "string"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "typing": {
+              "default": false,
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "participant_id",
+            "display_name",
+            "color"
           ],
           "type": "object"
         },
@@ -4046,6 +4341,18 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collaboration.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -4605,6 +4912,102 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.appearance",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collaboration.update",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollaborationUpdateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collaboration.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collaboration.leave",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollaborationLeaveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collaboration.claim",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollaborationClaimParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collaboration.release",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollaborationReleaseParams"
             }
           },
           "required": [
@@ -6371,6 +6774,162 @@
           ],
           "type": "string"
         },
+        "CollaborationActivity": {
+          "enum": [
+            "active",
+            "idle",
+            "away"
+          ],
+          "type": "string"
+        },
+        "CollaborationPaneClaim": {
+          "properties": {
+            "acquired_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "protected_until_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "updated_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "participant_id",
+            "acquired_at_unix_ms",
+            "updated_at_unix_ms",
+            "expires_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "CollaborationParticipant": {
+          "properties": {
+            "activity": {
+              "$ref": "#/schemas/success_response/$defs/CollaborationActivity"
+            },
+            "color": {
+              "type": "string"
+            },
+            "display_name": {
+              "type": "string"
+            },
+            "expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "participant_id": {
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/schemas/success_response/$defs/CollaborationRole"
+            },
+            "surface": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "typing": {
+              "type": "boolean"
+            },
+            "typing_expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "updated_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "participant_id",
+            "display_name",
+            "color",
+            "role",
+            "activity",
+            "surface",
+            "updated_at_unix_ms",
+            "expires_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "CollaborationRole": {
+          "enum": [
+            "owner",
+            "editor",
+            "viewer"
+          ],
+          "type": "string"
+        },
+        "CollaborationSnapshot": {
+          "properties": {
+            "lease_ttl_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_claims": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/CollaborationPaneClaim"
+              },
+              "type": "array"
+            },
+            "participants": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/CollaborationParticipant"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "participants",
+            "pane_claims",
+            "lease_ttl_ms"
+          ],
+          "type": "object"
+        },
         "ConfigReloadStatus": {
           "enum": [
             "applied",
@@ -7023,6 +7582,22 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "snapshot": {
+                  "$ref": "#/schemas/success_response/$defs/CollaborationSnapshot"
+                },
+                "type": {
+                  "const": "collaboration_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7068,7 +7643,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "collaboration_updated"
           ],
           "type": "string"
         },
@@ -8695,6 +9271,90 @@
               "required": [
                 "type",
                 "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "appearance": {
+                  "type": "string"
+                },
+                "background": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "foreground": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "theme_name": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_appearance",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "appearance",
+                "theme_name"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "snapshot": {
+                  "$ref": "#/schemas/success_response/$defs/CollaborationSnapshot"
+                },
+                "type": {
+                  "const": "collaboration_snapshot",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "claim": {
+                  "$ref": "#/schemas/success_response/$defs/CollaborationPaneClaim"
+                },
+                "granted": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "collaboration_claim",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "granted",
+                "claim"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "released": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "collaboration_released",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "released"
               ],
               "type": "object"
             },

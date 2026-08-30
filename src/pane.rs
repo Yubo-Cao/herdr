@@ -692,6 +692,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    resource_controller: Arc<crate::agent_resources::PaneResourceController>,
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
@@ -733,6 +734,7 @@ fn spawn_basic_detection_task(
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
+                    resource_controller.observe_agent_process(None);
                     state = AgentState::Unknown;
                     last_visible_idle = false;
                     last_visible_blocker = false;
@@ -844,6 +846,7 @@ fn spawn_basic_detection_task(
                         // from the previous process; a first acquisition keeps
                         // the evidence its own process already emitted.
                         clear_osc_evidence_for_agent_transition(&terminal, previous_agent);
+                        resource_controller.observe_agent_process(agent);
                         if let Some(agent) = agent {
                             agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
                             state = AgentState::Unknown;
@@ -868,6 +871,8 @@ fn spawn_basic_detection_task(
             let process_exited = pending_foreground_shell_clear
                 && agent.is_some()
                 && !foreground_shell_exit_reported;
+
+            resource_controller.enforce_watchdog();
 
             if lifecycle_authority_active && !process_exited {
                 pending_idle.clear();
@@ -1057,6 +1062,7 @@ pub struct PaneRuntime {
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+    resource_controller: Arc<crate::agent_resources::PaneResourceController>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -1247,6 +1253,7 @@ impl Drop for PaneRuntime {
                 self.child_pid.load(Ordering::Acquire),
                 self.child_wait_completed.as_deref(),
             );
+            self.resource_controller.cleanup();
         }
     }
 }
@@ -1612,6 +1619,7 @@ impl PaneRuntime {
             self.child_pid.load(Ordering::Acquire),
             self.child_wait_completed.as_deref(),
         );
+        self.resource_controller.cleanup();
         self.preserve_processes_on_drop = true;
     }
 
@@ -1679,6 +1687,7 @@ impl PaneRuntime {
             input_state: self.input_state(),
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
+            agent_memory_scope: self.resource_controller.handoff_scope_name(),
         }
     }
 
@@ -1889,6 +1898,7 @@ impl PaneRuntime {
             input_state,
             terminal_title,
             initial_history_ansi,
+            agent_memory_scope,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -1923,6 +1933,11 @@ impl PaneRuntime {
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let child_pid = Arc::new(AtomicU32::new(child_pid));
+        let resource_controller = crate::agent_resources::PaneResourceController::new(
+            pane_id,
+            child_pid.clone(),
+            agent_memory_scope,
+        );
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let content_seq = Arc::new(AtomicU64::new(0));
@@ -2001,6 +2016,7 @@ impl PaneRuntime {
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            resource_controller.clone(),
             events,
         );
 
@@ -2018,6 +2034,7 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            resource_controller,
             preserve_processes_on_drop: true,
             detect_handle: Some(detect_handle),
         })
@@ -2097,6 +2114,9 @@ impl PaneRuntime {
                 }
             });
         }
+
+        let resource_controller =
+            crate::agent_resources::PaneResourceController::new(pane_id, child_pid.clone(), None);
 
         let io = {
             let terminal = terminal.clone();
@@ -2179,6 +2199,7 @@ impl PaneRuntime {
             let state_events = events.clone();
             let detection_content_seq = detection_content_seq.clone();
             let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
+            let resource_controller_for_task = resource_controller.clone();
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detect_reset_notify = Arc::new(Notify::new());
@@ -2202,6 +2223,7 @@ impl PaneRuntime {
                 let mut foreground_shell_exit_reported = false;
                 let mut release_was_active = false;
                 let mut pending_restore_probe = initial_state.detected_agent.is_some();
+                let mut resource_restore_pending = initial_state.detected_agent.is_some();
                 let mut last_visible_blocker = false;
                 let mut last_visible_working = false;
                 let mut last_visible_signal_refresh = None;
@@ -2230,6 +2252,7 @@ impl PaneRuntime {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
                             agent_presence = AgentDetectionPresence::from_agent(None);
+                            resource_controller_for_task.observe_agent_process(None);
                             state = AgentState::Unknown;
                             last_visible_idle = false;
                             last_foreground_pgid = None;
@@ -2240,6 +2263,7 @@ impl PaneRuntime {
                             foreground_shell_exit_reported = false;
                             release_was_active = false;
                             pending_restore_probe = false;
+                            resource_restore_pending = false;
                             last_visible_blocker = false;
                             last_visible_working = false;
                             last_visible_signal_refresh = None;
@@ -2364,6 +2388,11 @@ impl PaneRuntime {
                             {
                                 acquisition_started_at = Some(now);
                             }
+                            if resource_restore_pending && new_agent.is_some() {
+                                resource_controller_for_task
+                                    .observe_agent_process(agent_presence.current_agent());
+                                resource_restore_pending = false;
+                            }
                             pending_restore_probe = false;
                             if changed {
                                 agent = agent_presence.current_agent();
@@ -2381,6 +2410,7 @@ impl PaneRuntime {
                                         &terminal,
                                         previous_agent,
                                     );
+                                    resource_controller_for_task.observe_agent_process(agent);
                                     if let Some(agent) = agent {
                                         agent_startup_grace_until =
                                             Some(now + AGENT_STARTUP_GRACE_WINDOW);
@@ -2435,6 +2465,8 @@ impl PaneRuntime {
                     let process_exited = pending_foreground_shell_clear
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
+
+                    resource_controller_for_task.enforce_watchdog();
 
                     if lifecycle_authority_active && !process_exited {
                         pending_idle.clear();
@@ -2574,6 +2606,7 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            resource_controller,
             preserve_processes_on_drop: false,
             detect_handle,
         })
@@ -2591,6 +2624,10 @@ impl PaneRuntime {
 
     pub fn reset_agent_detection(&self) {
         self.detect_reset_notify.notify_one();
+    }
+
+    pub fn refresh_agent_memory_limit(&self) {
+        self.resource_controller.refresh();
     }
 
     #[cfg(test)]
@@ -3095,6 +3132,11 @@ impl PaneRuntime {
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
+                resource_controller: crate::agent_resources::PaneResourceController::new(
+                    PaneId::from_raw(0),
+                    Arc::new(AtomicU32::new(0)),
+                    None,
+                ),
                 preserve_processes_on_drop: true,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -3664,6 +3706,11 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            resource_controller: crate::agent_resources::PaneResourceController::new(
+                PaneId::from_raw(0),
+                Arc::new(AtomicU32::new(0)),
+                None,
+            ),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -3696,6 +3743,11 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            resource_controller: crate::agent_resources::PaneResourceController::new(
+                PaneId::from_raw(0),
+                Arc::new(AtomicU32::new(0)),
+                None,
+            ),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };

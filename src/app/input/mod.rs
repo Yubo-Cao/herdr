@@ -139,6 +139,9 @@ impl App {
             self.paste_into_active_text_input(text);
             return;
         }
+        if self.state.focused_pane_controlled_externally() {
+            return;
+        }
 
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
@@ -169,6 +172,9 @@ impl App {
             self.paste_into_active_text_input(&text);
             return;
         }
+        if self.state.focused_pane_controlled_externally() {
+            return;
+        }
 
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
@@ -194,6 +200,9 @@ impl App {
         }
         if self.state.mode != Mode::Terminal {
             self.paste_into_active_text_input(&text);
+            return;
+        }
+        if self.state.focused_pane_controlled_externally() {
             return;
         }
 
@@ -385,8 +394,8 @@ impl App {
         }
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
-        if !handled_pane_double_click {
-            self.focus_pane_before_mouse_press(mouse);
+        if !handled_pane_double_click && self.focus_pane_before_mouse_press(mouse) {
+            return;
         }
 
         let previous_agent_panel_sort = self.state.agent_panel_sort;
@@ -537,14 +546,14 @@ impl App {
         }
     }
 
-    fn focus_pane_before_mouse_press(&mut self, mouse: MouseEvent) {
+    fn focus_pane_before_mouse_press(&mut self, mouse: MouseEvent) -> bool {
         if !matches!(self.state.mode, Mode::Terminal | Mode::Resize)
             || !matches!(
                 mouse.kind,
                 MouseEventKind::Down(MouseButton::Left | MouseButton::Middle)
             )
         {
-            return;
+            return false;
         }
 
         let Some(pane_id) = self
@@ -552,14 +561,38 @@ impl App {
             .pane_at(mouse.column, mouse.row)
             .map(|info| info.id)
         else {
-            return;
+            return false;
         };
         let Some(ws_idx) = self.state.active else {
-            return;
+            return false;
         };
 
         // Focus through the runtime API before an application can consume its press.
         self.focus_pane_internal_via_api(ws_idx, pane_id);
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !self.state.pane_controlled_externally(ws_idx, pane_id)
+        {
+            return false;
+        }
+
+        self.last_pane_click = None;
+        self.state.selection = None;
+        self.state.selection_autoscroll = None;
+        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            self.state.context_menu = None;
+            self.state.request_takeover_focused_pane = true;
+            self.state.mode = Mode::Terminal;
+        } else {
+            self.state.context_menu = Some(super::state::ContextMenuState {
+                kind: super::state::ContextMenuKind::PaneControl { ws_idx, pane_id },
+                x: mouse.column,
+                y: mouse.row,
+                list: super::state::MenuListState::new(0),
+            });
+            self.state.mode = Mode::ContextMenu;
+        }
+        true
     }
 
     fn handle_modified_url_click(

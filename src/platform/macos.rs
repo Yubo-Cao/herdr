@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -928,6 +929,115 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         .collect()
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcTaskInfo {
+    virtual_size: u64,
+    resident_size: u64,
+    total_user: u64,
+    total_system: u64,
+    threads_user: u64,
+    threads_system: u64,
+    policy: i32,
+    faults: i32,
+    pageins: i32,
+    cow_faults: i32,
+    messages_sent: i32,
+    messages_received: i32,
+    syscalls_mach: i32,
+    syscalls_unix: i32,
+    context_switches: i32,
+    thread_count: i32,
+    running_thread_count: i32,
+    priority: i32,
+}
+
+pub(crate) fn agent_process_usage(child_pid: u32) -> Option<super::AgentProcessUsage> {
+    let pids = agent_process_tree(child_pid);
+    if pids.is_empty() {
+        return None;
+    }
+    let mut total = 0_u64;
+    let mut observed = false;
+    for &pid in &pids {
+        let Some(resident_size) = process_resident_bytes(pid) else {
+            continue;
+        };
+        observed = true;
+        total = total.saturating_add(resident_size);
+    }
+    observed.then_some(super::AgentProcessUsage {
+        pids,
+        resident_bytes: total,
+    })
+}
+
+fn agent_process_tree(child_pid: u32) -> Vec<u32> {
+    let Some(foreground_group) = foreground_process_group_id(child_pid) else {
+        return Vec::new();
+    };
+    let shell_group =
+        process_bsdinfo(child_pid).and_then(|info| (info.pbi_pgid > 0).then_some(info.pbi_pgid));
+    if shell_group == Some(foreground_group) {
+        return Vec::new();
+    }
+
+    let roots = process_group_pids(foreground_group);
+    let parent_pairs = all_pids().into_iter().filter_map(|pid| {
+        let info = process_bsdinfo(pid)?;
+        (info.pbi_ppid > 0).then_some((pid, info.pbi_ppid))
+    });
+    process_tree_from_parents(roots, parent_pairs)
+}
+
+fn process_tree_from_parents(
+    roots: impl IntoIterator<Item = u32>,
+    processes: impl IntoIterator<Item = (u32, u32)>,
+) -> Vec<u32> {
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for (pid, parent_pid) in processes {
+        children.entry(parent_pid).or_default().push(pid);
+    }
+
+    let mut pending = VecDeque::new();
+    let mut visited = HashSet::new();
+    for pid in roots {
+        if pid > 0 && visited.insert(pid) {
+            pending.push_back(pid);
+        }
+    }
+
+    let mut pids = Vec::new();
+    while let Some(pid) = pending.pop_front() {
+        pids.push(pid);
+        if let Some(descendants) = children.get(&pid) {
+            for &descendant in descendants {
+                if visited.insert(descendant) {
+                    pending.push_back(descendant);
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn process_resident_bytes(pid: u32) -> Option<u64> {
+    const PROC_PIDTASKINFO: libc::c_int = 4;
+
+    let mut info = ProcTaskInfo::default();
+    let size = std::mem::size_of::<ProcTaskInfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (read == size).then_some(info.resident_size)
+}
+
 fn all_pids() -> Vec<u32> {
     let initial_count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let mut capacity = if initial_count > 0 {
@@ -1018,6 +1128,23 @@ mod tests {
             target_nofile_soft_limit(16_384, libc::RLIM_INFINITY, 8192),
             None
         );
+    }
+
+    #[test]
+    fn agent_process_tree_excludes_background_siblings() {
+        let tree = process_tree_from_parents(
+            [200, 201],
+            [
+                (200, 100),
+                (201, 100),
+                (210, 200),
+                (211, 210),
+                (300, 100),
+                (301, 300),
+            ],
+        );
+
+        assert_eq!(tree, vec![200, 201, 210, 211]);
     }
 
     fn build_procargs2(exec_path: &str, argv: &[&str], env: &[&str]) -> Vec<u8> {

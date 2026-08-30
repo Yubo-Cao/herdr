@@ -409,6 +409,9 @@ pub(crate) fn focused_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> Option<CursorState> {
+    if app_state.focused_pane_controlled_externally() {
+        return None;
+    }
     crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
 }
 

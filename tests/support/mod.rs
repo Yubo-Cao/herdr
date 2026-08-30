@@ -15,7 +15,10 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 21;
+// Keep raw integration clients aligned with the production wire contract. The
+// collaboration extensions are API/server-side additions, so the advertised
+// protocol intentionally remains compatible with stock Herdr 0.8.2 clients.
+pub const CURRENT_PROTOCOL: u32 = 20;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {

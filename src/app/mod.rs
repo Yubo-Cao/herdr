@@ -402,6 +402,7 @@ impl App {
         event_hub: crate::api::EventHub,
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
+        crate::agent_resources::configure(&config.resources);
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
@@ -550,6 +551,7 @@ impl App {
         let (theme_palette, theme_name) = resolve_effective_theme(&theme_runtime, None);
 
         let mut state = AppState {
+            collaboration: crate::collaboration::CollaborationState::default(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -572,6 +574,7 @@ impl App {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_takeover_focused_pane: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
@@ -836,6 +839,7 @@ impl App {
             u32,
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
+        collaboration: Option<crate::api::schema::CollaborationSnapshot>,
     ) -> io::Result<Self> {
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
@@ -882,6 +886,12 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        if let Some(collaboration) = collaboration {
+            app.state.collaboration = crate::collaboration::CollaborationState::from_snapshot(
+                collaboration,
+                crate::collaboration::unix_ms(),
+            );
+        }
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -1571,6 +1581,13 @@ impl App {
             }
         }
 
+        if !invalid_section("resources") {
+            crate::agent_resources::configure(&config.resources);
+            for runtime in self.terminal_runtimes.values() {
+                runtime.refresh_agent_memory_limit();
+            }
+        }
+
         if !invalid_section("advanced") {
             self.state.pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes;
         }
@@ -1789,40 +1806,55 @@ impl App {
             let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
-                    let lease_key = input::InputLeaseKey::new(source_id, &key);
-                    let key = self.input_leases.normalize_press(&lease_key, key);
-                    match key.kind {
-                        crossterm::event::KeyEventKind::Press => {
-                            let initial_context = self.terminal_input_context();
-                            let target = if initial_context.is_some() {
-                                self.handle_terminal_key_headless_from(source_id, key.clone())
-                            } else {
-                                self.handle_non_terminal_key_headless(key.clone());
-                                None
-                            };
-                            let resulting_context = self.terminal_input_context();
-                            let plan = self.input_leases.complete_press(
-                                lease_key,
-                                &key,
-                                initial_context.as_ref(),
-                                resulting_context.as_ref(),
-                                target,
-                            );
-                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                    if self.state.popup_pane.is_none()
+                        && self.state.mode == Mode::Terminal
+                        && self.state.focused_pane_controlled_externally()
+                    {
+                        // Keep Herdr's terminal-mode shortcuts available to an observing TUI,
+                        // including the prefix/global menu used to take control. Ordinary pane
+                        // input is discarded before it can acquire a press/repeat lease.
+                        if key.kind == crossterm::event::KeyEventKind::Press {
+                            self.handle_terminal_key_headless_from(source_id, key);
                         }
-                        crossterm::event::KeyEventKind::Repeat => {
-                            let current_context = self.terminal_input_context();
-                            let plan = self.input_leases.plan_repeat(
-                                lease_key,
-                                &key,
-                                current_context.as_ref(),
-                            );
-                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
-                        }
-                        crossterm::event::KeyEventKind::Release => {
-                            if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                                let _ = self
-                                    .forward_terminal_key_to_target_headless(&lease.target, key);
+                    } else {
+                        let lease_key = input::InputLeaseKey::new(source_id, &key);
+                        let key = self.input_leases.normalize_press(&lease_key, key);
+                        match key.kind {
+                            crossterm::event::KeyEventKind::Press => {
+                                let initial_context = self.terminal_input_context();
+                                let target = if initial_context.is_some() {
+                                    self.handle_terminal_key_headless_from(source_id, key.clone())
+                                } else {
+                                    self.handle_non_terminal_key_headless(key.clone());
+                                    None
+                                };
+                                let resulting_context = self.terminal_input_context();
+                                let plan = self.input_leases.complete_press(
+                                    lease_key,
+                                    &key,
+                                    initial_context.as_ref(),
+                                    resulting_context.as_ref(),
+                                    target,
+                                );
+                                self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            }
+                            crossterm::event::KeyEventKind::Repeat => {
+                                let current_context = self.terminal_input_context();
+                                let plan = self.input_leases.plan_repeat(
+                                    lease_key,
+                                    &key,
+                                    current_context.as_ref(),
+                                );
+                                self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            }
+                            crossterm::event::KeyEventKind::Release => {
+                                if let Some(lease) = self.input_leases.remove_forwarded(&lease_key)
+                                {
+                                    let _ = self.forward_terminal_key_to_target_headless(
+                                        &lease.target,
+                                        key,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1842,7 +1874,7 @@ impl App {
                     if self.try_route_paste_to_popup(&text) {
                     } else if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
-                    } else {
+                    } else if !self.state.focused_pane_controlled_externally() {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
                                 if let Some(focused) = ws.focused_pane_id() {
@@ -5591,6 +5623,53 @@ last_pane = "prefix+tab"
         assert_eq!(rx.recv().await.unwrap().as_ref(), "你🙂".as_bytes());
         assert!(rx.try_recv().is_err());
         assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remotely_controlled_focused_pane_ignores_native_terminal_input() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let terminal_id = workspace.terminal_id(focused).unwrap().clone();
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state
+            .direct_attach_resize_locks
+            .insert(terminal_id.clone());
+
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new("text")),
+                crate::raw_input::RawInputEvent::Paste("paste".into()),
+                raw_key(
+                    KeyCode::Char('x'),
+                    KeyModifiers::empty(),
+                    KeyEventKind::Press,
+                ),
+            ],
+            false,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+
+        app.state.direct_attach_resize_locks.remove(&terminal_id);
+        app.route_client_events(
+            vec![raw_key(
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
+            false,
+        );
+        assert_eq!(
+            rx.try_recv().expect("input after native takeover"),
+            bytes::Bytes::from_static(b"x")
+        );
     }
 
     #[tokio::test]

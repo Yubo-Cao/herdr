@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 // Protocol constants
 // ---------------------------------------------------------------------------
 
-/// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 21;
+/// Current protocol version. This fork deliberately retains the stock 0.8.2
+/// value: the message definitions have not changed since that tag, and keeping
+/// the advertised version stable preserves stock TUI and CLI compatibility.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -1853,6 +1855,11 @@ mod tests {
             check_client_version(PROTOCOL_VERSION),
             VersionCheck::Compatible
         );
+    }
+
+    #[test]
+    fn protocol_remains_compatible_with_stock_0_8_2_clients() {
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]

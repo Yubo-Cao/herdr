@@ -54,6 +54,7 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
     io::stdout().flush()
 }
 
+mod agent_resources;
 mod agent_resume;
 mod api;
 mod app;
@@ -61,6 +62,7 @@ mod build_info;
 mod checksum;
 mod cli;
 mod client;
+mod collaboration;
 mod config;
 mod detect;
 mod events;
@@ -266,6 +268,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 [server]
 # headless_cols = 120
 # headless_rows = 40
+
+[resources]
+# Maximum physical memory for each detected Claude or Codex process tree.
+# Linux enforces these with cgroup v2; macOS uses a process-tree RSS watchdog.
+# Linux also permits at most the same number of swap bytes per agent.
+# Set either value to 0 to disable that agent's limit.
+# claude_memory_limit_bytes = 4294967296
+# codex_memory_limit_bytes = 4294967296
 
 # [worktrees]
 # directory = "~/.herdr/worktrees"

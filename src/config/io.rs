@@ -10,6 +10,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "keys",
     "onboarding",
     "remote",
+    "resources",
     "server",
     "session",
     "terminal",
@@ -292,6 +293,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.session = section,
+    );
+    load_live_section(
+        table,
+        "resources",
+        "resource config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.resources = section,
     );
     load_live_section(
         table,
@@ -870,6 +879,23 @@ resume_agents_on_restore = true
         .unwrap();
 
         assert!(loaded.config.session.resume_agents_on_restore);
+        assert!(loaded.diagnostics.is_empty());
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_parses_resource_section() {
+        let loaded = load_live_config_from_str(
+            r#"
+[resources]
+claude_memory_limit_bytes = 1073741824
+codex_memory_limit_bytes = 2147483648
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.resources.claude_memory_limit_bytes, 1 << 30);
+        assert_eq!(loaded.config.resources.codex_memory_limit_bytes, 2 << 30);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
     }

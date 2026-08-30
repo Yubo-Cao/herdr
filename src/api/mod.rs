@@ -25,6 +25,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
         Method::ServerReloadConfig(_)
             | Method::ServerReloadAgentManifests(_)
             | Method::NotificationShow(_)
+            | Method::CollaborationUpdate(_)
+            | Method::CollaborationLeave(_)
             | Method::WorkspaceCreate(_)
             | Method::WorkspaceFocus(_)
             | Method::WorkspaceRename(_)
@@ -92,4 +94,46 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::{
+        CollaborationActivity, CollaborationLeaveParams, CollaborationRole,
+        CollaborationUpdateParams, EmptyParams,
+    };
+
+    #[test]
+    fn collaboration_presence_mutations_invalidate_the_ui() {
+        let update = Request {
+            id: "update".into(),
+            method: Method::CollaborationUpdate(CollaborationUpdateParams {
+                participant_id: "participant".into(),
+                display_name: "Participant".into(),
+                color: "#0969da".into(),
+                role: CollaborationRole::Editor,
+                activity: CollaborationActivity::Active,
+                surface: "web".into(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: Some("pane".into()),
+                typing: false,
+            }),
+        };
+        let leave = Request {
+            id: "leave".into(),
+            method: Method::CollaborationLeave(CollaborationLeaveParams {
+                participant_id: "participant".into(),
+            }),
+        };
+        let list = Request {
+            id: "list".into(),
+            method: Method::CollaborationList(EmptyParams {}),
+        };
+
+        assert!(request_changes_ui(&update));
+        assert!(request_changes_ui(&leave));
+        assert!(!request_changes_ui(&list));
+    }
 }

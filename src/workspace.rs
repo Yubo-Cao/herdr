@@ -1534,11 +1534,16 @@ mod tests {
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+        for id in [&first, &second] {
+            assert!(
+                id.len() <= 14,
+                "workspace id exceeds the compact u64 base32 bound: {id}"
+            );
+            assert!(
+                decode_public_number(&id[1..]).is_some(),
+                "workspace id is not valid base32: {id}"
+            );
+        }
     }
 
     #[test]

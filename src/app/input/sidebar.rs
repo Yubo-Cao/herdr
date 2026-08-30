@@ -197,7 +197,11 @@ impl AppState {
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
-        let mut labels = vec!["settings", "keybinds", "reload config"];
+        let mut labels = Vec::new();
+        if self.focused_pane_controlled_externally() {
+            labels.push("take pane control");
+        }
+        labels.extend(["settings", "keybinds", "reload config"]);
         if self.update_available.is_some() {
             labels.push("update ready");
         } else if self.latest_release_notes_available {

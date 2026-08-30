@@ -44,6 +44,10 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Ephemeral participant leases and pane claims survive a live replacement.
+    /// Absent from manifests written by stock and older forked servers.
+    #[serde(default)]
+    pub collaboration: Option<crate::api::schema::CollaborationSnapshot>,
 }
 
 #[cfg(unix)]
@@ -310,6 +314,7 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    collaboration: Option<crate::api::schema::CollaborationSnapshot>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -320,6 +325,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        collaboration,
     }
 }
 
@@ -496,6 +502,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
@@ -509,6 +516,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
         value
@@ -520,5 +528,20 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[test]
+    fn a_manifest_written_before_collaboration_still_loads() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("collaboration");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        assert!(older.collaboration.is_none());
     }
 }

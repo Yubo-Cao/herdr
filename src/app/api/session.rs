@@ -13,6 +13,35 @@ impl App {
         )
     }
 
+    pub(super) fn handle_session_appearance(&mut self, id: String) -> String {
+        let color = |value: Option<crate::terminal_theme::RgbColor>| {
+            value.map(|color| format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b))
+        };
+        let appearance = match self.state.host_terminal_appearance {
+            Some(crate::terminal_theme::HostAppearance::Light) => "light",
+            Some(crate::terminal_theme::HostAppearance::Dark) => "dark",
+            None => self
+                .state
+                .host_terminal_theme
+                .background
+                .map_or("unknown", |background| {
+                    match background.inferred_appearance() {
+                        crate::terminal_theme::HostAppearance::Light => "light",
+                        crate::terminal_theme::HostAppearance::Dark => "dark",
+                    }
+                }),
+        };
+        encode_success(
+            id,
+            ResponseResult::SessionAppearance {
+                appearance: appearance.into(),
+                foreground: color(self.state.host_terminal_theme.foreground),
+                background: color(self.state.host_terminal_theme.background),
+                theme_name: self.state.theme_name.clone(),
+            },
+        )
+    }
+
     fn session_snapshot(&self) -> SessionSnapshot {
         let focused_workspace_id = self
             .state

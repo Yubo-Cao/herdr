@@ -1256,6 +1256,10 @@ pub(crate) struct TabPressState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
+    PaneControl {
+        ws_idx: usize,
+        pane_id: PaneId,
+    },
     Workspace {
         ws_idx: usize,
     },
@@ -1290,6 +1294,9 @@ pub struct ContextMenuState {
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&'static str> {
         match self.kind {
+            ContextMenuKind::PaneControl { .. } => {
+                vec!["Take control (Shift-click)", "Keep watching"]
+            }
             ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
@@ -1434,6 +1441,8 @@ pub enum TabBarStatusSegment {
 }
 
 pub struct AppState {
+    /// Ephemeral multi-user presence and advisory pane-control leases.
+    pub(crate) collaboration: crate::collaboration::CollaborationState,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
@@ -1463,6 +1472,9 @@ pub struct AppState {
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
     pub request_reload_config: bool,
+    /// Set by the native TUI when the user explicitly reclaims the focused
+    /// pane from a writable direct-attach client such as Herdr Studio.
+    pub request_takeover_focused_pane: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
     pub request_client_config_reload: bool,
@@ -1786,6 +1798,27 @@ impl AppState {
         self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
     }
 
+    pub(crate) fn pane_controlled_externally(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        self.workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .is_some_and(|terminal_id| self.direct_attach_resize_locks.contains(terminal_id))
+    }
+
+    pub(crate) fn focused_pane_controlled_externally(&self) -> bool {
+        let Some(ws_idx) = self.active else {
+            return false;
+        };
+        self.workspaces
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            .is_some_and(|pane_id| self.pane_controlled_externally(ws_idx, pane_id))
+    }
+
     pub fn is_active_pane(
         &self,
         ws_idx: usize,
@@ -1829,6 +1862,7 @@ impl AppState {
     /// Create an AppState for testing — no channels, no PTYs.
     pub fn test_new() -> Self {
         Self {
+            collaboration: crate::collaboration::CollaborationState::default(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -1852,6 +1886,7 @@ impl AppState {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_takeover_focused_pane: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
@@ -2303,6 +2338,17 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
+                ContextMenuKind::PaneControl { ws_idx, pane_id } => {
+                    assert_workspace_index(ws_idx, "pane control menu workspace");
+                    assert!(
+                        self.workspaces[ws_idx]
+                            .find_tab_index_for_pane(pane_id)
+                            .is_some(),
+                        "pane control menu references pane {:?} outside workspace {}",
+                        pane_id,
+                        ws_idx
+                    );
+                }
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")

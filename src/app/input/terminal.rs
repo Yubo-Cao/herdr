@@ -139,6 +139,9 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_id = ws.focused_pane_id()?;
         let terminal_id = ws.terminal_id(pane_id)?.clone();
+        if self.state.direct_attach_resize_locks.contains(&terminal_id) {
+            return None;
+        }
         let rt =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
@@ -314,6 +317,13 @@ impl App {
         target: &TerminalInputTarget,
         key: TerminalKey,
     ) -> bool {
+        if self
+            .state
+            .direct_attach_resize_locks
+            .contains(&target.terminal_id)
+        {
+            return false;
+        }
         let Some(runtime) = self.terminal_input_runtime(target) else {
             return false;
         };
@@ -326,6 +336,13 @@ impl App {
         target: &TerminalInputTarget,
         key: TerminalKey,
     ) -> bool {
+        if self
+            .state
+            .direct_attach_resize_locks
+            .contains(&target.terminal_id)
+        {
+            return false;
+        }
         let Some(runtime) = self.terminal_input_runtime(target) else {
             return false;
         };
@@ -347,6 +364,15 @@ impl App {
                 .with_kind(crossterm::event::KeyEventKind::Release);
             let _ = self.forward_terminal_key_to_target_headless(&pressed.target, release);
         }
+    }
+
+    pub(crate) fn release_terminal_input_headless(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) {
+        self.release_input_target_headless(&TerminalInputTarget {
+            terminal_id: terminal_id.clone(),
+        });
     }
 
     pub(crate) fn release_input_source_headless(&mut self, source_id: crate::app::InputSourceId) {

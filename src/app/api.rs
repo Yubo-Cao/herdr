@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 mod agent_view;
 mod agents;
+mod collaboration;
 mod env;
 mod integrations;
 mod layouts;
@@ -913,6 +914,9 @@ impl App {
         pane_id: crate::layout::PaneId,
         event: crate::ghostty::FocusEvent,
     ) {
+        if self.state.pane_controlled_externally(ws_idx, pane_id) {
+            return;
+        }
         let Some(runtime) = self.state.workspaces.get(ws_idx).and_then(|_| {
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
@@ -1010,6 +1014,20 @@ impl App {
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
+            Method::SessionAppearance(_) => return self.handle_session_appearance(request.id),
+            Method::CollaborationUpdate(params) => {
+                return self.handle_collaboration_update(request.id, params)
+            }
+            Method::CollaborationList(_) => return self.handle_collaboration_list(request.id),
+            Method::CollaborationLeave(params) => {
+                return self.handle_collaboration_leave(request.id, params)
+            }
+            Method::CollaborationClaim(params) => {
+                return self.handle_collaboration_claim(request.id, params)
+            }
+            Method::CollaborationRelease(params) => {
+                return self.handle_collaboration_release(request.id, params)
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {

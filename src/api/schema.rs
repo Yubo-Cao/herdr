@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod collaboration;
 pub mod common;
 pub mod events;
 pub mod integrations;
@@ -14,6 +15,7 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::*;
+pub use collaboration::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
@@ -63,6 +65,18 @@ pub enum Method {
     ClientWindowTitleClear(EmptyParams),
     #[serde(rename = "session.snapshot")]
     SessionSnapshot(EmptyParams),
+    #[serde(rename = "session.appearance")]
+    SessionAppearance(EmptyParams),
+    #[serde(rename = "collaboration.update")]
+    CollaborationUpdate(CollaborationUpdateParams),
+    #[serde(rename = "collaboration.list")]
+    CollaborationList(EmptyParams),
+    #[serde(rename = "collaboration.leave")]
+    CollaborationLeave(CollaborationLeaveParams),
+    #[serde(rename = "collaboration.claim")]
+    CollaborationClaim(CollaborationClaimParams),
+    #[serde(rename = "collaboration.release")]
+    CollaborationRelease(CollaborationReleaseParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]

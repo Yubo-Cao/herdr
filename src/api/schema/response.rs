@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::agents::AgentInfo;
+use super::collaboration::{CollaborationPaneClaim, CollaborationSnapshot};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::integrations::{
@@ -50,6 +51,24 @@ pub enum ResponseResult {
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
+    },
+    SessionAppearance {
+        appearance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+        theme_name: String,
+    },
+    CollaborationSnapshot {
+        snapshot: CollaborationSnapshot,
+    },
+    CollaborationClaim {
+        granted: bool,
+        claim: CollaborationPaneClaim,
+    },
+    CollaborationReleased {
+        released: bool,
     },
     WorkspaceInfo {
         workspace: WorkspaceInfo,

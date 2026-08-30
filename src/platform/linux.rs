@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::Write,
     os::fd::RawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
 };
@@ -23,6 +23,18 @@ pub(crate) use super::unix_common::{
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const AGENT_CONTROL_CGROUP: &str = ".herdr-control";
+const AGENT_CGROUP_ROOT: &str = ".herdr-agents";
+const AGENT_CGROUP_MIGRATION_PASSES: usize = 4;
+
+#[derive(Debug)]
+struct AgentMemoryCgroupPaths {
+    agents: PathBuf,
+}
+
+static AGENT_MEMORY_CGROUP_PATHS: OnceLock<Result<AgentMemoryCgroupPaths, String>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessDetectionMode {
@@ -420,6 +432,391 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
     pids
 }
 
+pub(crate) fn prepare_agent_memory_controller() -> Result<bool, String> {
+    agent_memory_cgroup_paths().map(|_| true)
+}
+
+pub(crate) fn apply_agent_memory_limit(
+    existing_scope: Option<&str>,
+    pane_id: u32,
+    child_pid: u32,
+    limit_bytes: u64,
+) -> Result<Option<String>, String> {
+    let paths = agent_memory_cgroup_paths()?;
+    let scope = match existing_scope {
+        Some(scope) if valid_agent_memory_scope(scope) => scope.to_string(),
+        Some(scope) => return Err(format!("invalid handed-off agent memory scope {scope:?}")),
+        None => format!("pane-{pane_id}-{child_pid}"),
+    };
+    let leaf = paths.agents.join(&scope);
+    std::fs::create_dir(&leaf)
+        .or_else(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+        .map_err(|err| format!("create {}: {err}", leaf.display()))?;
+
+    write_cgroup_value(&leaf.join("memory.oom.group"), "1")?;
+    write_cgroup_value(&leaf.join("memory.max"), &limit_bytes.to_string())?;
+    let swap_max = leaf.join("memory.swap.max");
+    if swap_max.exists() {
+        // Keep optional host swap useful as a burst buffer without allowing one
+        // agent to monopolize it. The swap allowance mirrors the RAM limit.
+        write_cgroup_value(&swap_max, &limit_bytes.to_string())?;
+    }
+
+    let cgroup_procs = leaf.join("cgroup.procs");
+    migrate_agent_process_tree_with(
+        child_pid,
+        foreground_agent_process_tree,
+        || read_cgroup_processes(&cgroup_procs),
+        |pid| match std::fs::write(&cgroup_procs, pid.to_string()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(err) => Err(format!("move PID {pid} into {}: {err}", leaf.display())),
+        },
+    )?;
+
+    Ok(Some(scope))
+}
+
+fn migrate_agent_process_tree_with(
+    child_pid: u32,
+    mut process_tree: impl FnMut(u32) -> Vec<u32>,
+    mut cgroup_processes: impl FnMut() -> Result<HashSet<u32>, String>,
+    mut migrate: impl FnMut(u32) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut observed_tree = false;
+    for _ in 0..AGENT_CGROUP_MIGRATION_PASSES {
+        let pids = process_tree(child_pid);
+        if pids.is_empty() {
+            return if observed_tree {
+                Ok(())
+            } else {
+                Err("the detected agent process tree is no longer available".to_string())
+            };
+        }
+        observed_tree = true;
+
+        let members = cgroup_processes()?;
+        let pending = pids
+            .into_iter()
+            .filter(|pid| !members.contains(pid))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for pid in pending {
+            migrate(pid)?;
+        }
+    }
+
+    let members = cgroup_processes()?;
+    let escaped = process_tree(child_pid)
+        .into_iter()
+        .filter(|pid| !members.contains(pid))
+        .collect::<Vec<_>>();
+    if escaped.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "agent process tree kept changing while applying the memory limit; {} process(es) escaped migration",
+            escaped.len()
+        ))
+    }
+}
+
+fn read_cgroup_processes(path: &Path) -> Result<HashSet<u32>, String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    Ok(contents
+        .split_whitespace()
+        .filter_map(|pid| pid.parse::<u32>().ok())
+        .collect())
+}
+
+pub(crate) fn disable_agent_memory_limit(scope: &str) -> Result<(), String> {
+    let paths = agent_memory_cgroup_paths()?;
+    if !valid_agent_memory_scope(scope) {
+        return Err(format!("invalid agent memory scope {scope:?}"));
+    }
+    let leaf = paths.agents.join(scope);
+    if leaf.exists() {
+        write_cgroup_value(&leaf.join("memory.max"), "max")?;
+        let swap_max = leaf.join("memory.swap.max");
+        if swap_max.exists() {
+            write_cgroup_value(&swap_max, "max")?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_agent_memory_scope(scope: &str) -> Result<(), String> {
+    let paths = agent_memory_cgroup_paths()?;
+    if !valid_agent_memory_scope(scope) {
+        return Err(format!("invalid agent memory scope {scope:?}"));
+    }
+    let leaf = paths.agents.join(scope);
+    if !leaf.exists() {
+        return Ok(());
+    }
+
+    let kill = leaf.join("cgroup.kill");
+    if kill.exists() {
+        let _ = std::fs::write(kill, "1");
+    } else if let Ok(processes) = std::fs::read_to_string(leaf.join("cgroup.procs")) {
+        let pids = processes
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        signal_processes(&pids, Signal::Kill);
+    }
+
+    std::fs::remove_dir(&leaf).map_err(|err| format!("remove {}: {err}", leaf.display()))
+}
+
+pub(crate) fn agent_process_usage(child_pid: u32) -> Option<super::AgentProcessUsage> {
+    let pids = foreground_agent_process_tree(child_pid);
+    if pids.is_empty() {
+        return None;
+    }
+    let page_size = page_size_bytes()?;
+    let mut total = 0_u64;
+    let mut observed = false;
+    for &pid in &pids {
+        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok();
+        let Some(resident_pages) = statm
+            .as_deref()
+            .and_then(|statm| statm.split_whitespace().nth(1))
+            .and_then(|pages| pages.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        observed = true;
+        total = total.saturating_add(resident_pages.saturating_mul(page_size));
+    }
+    observed.then_some(super::AgentProcessUsage {
+        pids,
+        resident_bytes: total,
+    })
+}
+
+fn foreground_agent_process_tree(child_pid: u32) -> Vec<u32> {
+    let Some(job) = foreground_job(child_pid) else {
+        return Vec::new();
+    };
+    let shell_group =
+        process_pgrp_and_comm(child_pid).and_then(|(group, _)| (group > 0).then_some(group as u32));
+    if shell_group == Some(job.process_group_id) {
+        return Vec::new();
+    }
+    process_tree_pids(
+        job.processes.into_iter().map(|process| process.pid),
+        process_task_ids,
+        process_task_children,
+    )
+    .into_iter()
+    .filter(|pid| *pid != child_pid)
+    .collect()
+}
+
+fn page_size_bytes() -> Option<u64> {
+    static PAGE_SIZE: OnceLock<Option<u64>> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        (size > 0).then_some(size as u64)
+    })
+}
+
+fn agent_memory_cgroup_paths() -> Result<&'static AgentMemoryCgroupPaths, String> {
+    match AGENT_MEMORY_CGROUP_PATHS.get_or_init(initialize_agent_memory_cgroups) {
+        Ok(paths) => Ok(paths),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+fn initialize_agent_memory_cgroups() -> Result<AgentMemoryCgroupPaths, String> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|err| format!("read /proc/self/cgroup: {err}"))?;
+    let relative = unified_cgroup_path(&membership)
+        .ok_or_else(|| "unified cgroup v2 membership was not found".to_string())?;
+    let current = Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/'));
+    let delegated_root =
+        if current.file_name().and_then(|name| name.to_str()) == Some(AGENT_CONTROL_CGROUP) {
+            current
+                .parent()
+                .ok_or_else(|| "invalid Herdr control cgroup path".to_string())?
+                .to_path_buf()
+        } else if current
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some(AGENT_CGROUP_ROOT)
+        {
+            current
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| "invalid Herdr agent cgroup path".to_string())?
+                .to_path_buf()
+        } else {
+            current.clone()
+        };
+    if !cgroup_is_service(&delegated_root) {
+        let processes =
+            std::fs::read_to_string(delegated_root.join("cgroup.procs")).map_err(|err| {
+                format!(
+                    "read cgroup processes for {}: {err}",
+                    delegated_root.display()
+                )
+            })?;
+        let current_pid = std::process::id();
+        if processes
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .any(|pid| pid != current_pid)
+        {
+            return Err(format!(
+                "the current non-service cgroup {} is shared with other processes",
+                delegated_root.display()
+            ));
+        }
+    }
+    let control = delegated_root.join(AGENT_CONTROL_CGROUP);
+    std::fs::create_dir(&control)
+        .or_else(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+        .map_err(|err| {
+            format!(
+                "create delegated control cgroup {}: {err}; set Delegate=yes on the Herdr service",
+                control.display()
+            )
+        })?;
+
+    if cgroup_is_service(&delegated_root) {
+        move_direct_cgroup_processes(&delegated_root, &control)?;
+    } else if current != control {
+        // Outside a service unit, do not reorganize an enclosing terminal or
+        // desktop scope that may contain processes Herdr does not own.
+        write_cgroup_value(
+            &control.join("cgroup.procs"),
+            &std::process::id().to_string(),
+        )?;
+    }
+    enable_cgroup_controller(&delegated_root, "memory")?;
+
+    let agents = delegated_root.join(AGENT_CGROUP_ROOT);
+    std::fs::create_dir(&agents)
+        .or_else(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+        .map_err(|err| format!("create {}: {err}", agents.display()))?;
+    enable_cgroup_controller(&agents, "memory")?;
+
+    Ok(AgentMemoryCgroupPaths { agents })
+}
+
+fn unified_cgroup_path(membership: &str) -> Option<&str> {
+    membership.lines().find_map(|line| line.strip_prefix("0::"))
+}
+
+fn cgroup_is_service(cgroup: &Path) -> bool {
+    cgroup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".service"))
+}
+
+fn move_direct_cgroup_processes(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_procs = source.join("cgroup.procs");
+    let destination_procs = destination.join("cgroup.procs");
+
+    // A live upgrade can inherit every old pane directly in the service root.
+    // Evacuating that root is a cgroup-only move: PIDs, PTYs, and process state
+    // are unchanged, and moved parents make newly forked children inherit the
+    // control leaf. Retry a few times to close races with concurrent forks.
+    for _ in 0..16 {
+        let processes = std::fs::read_to_string(&source_procs)
+            .map_err(|err| format!("read {}: {err}", source_procs.display()))?;
+        let pids = processes
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
+            return Ok(());
+        }
+
+        for pid in pids {
+            if let Err(err) = std::fs::write(&destination_procs, pid.to_string()) {
+                if err.kind() != std::io::ErrorKind::NotFound
+                    && err.raw_os_error() != Some(libc::ESRCH)
+                {
+                    return Err(format!(
+                        "move PID {pid} from {} to {}: {err}",
+                        source.display(),
+                        destination.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "could not evacuate direct processes from {} while enabling the memory controller",
+        source.display()
+    ))
+}
+
+fn enable_cgroup_controller(cgroup: &Path, controller: &str) -> Result<(), String> {
+    let subtree_control = cgroup.join("cgroup.subtree_control");
+    let enabled = std::fs::read_to_string(&subtree_control)
+        .map_err(|err| format!("read {}: {err}", subtree_control.display()))?;
+    if enabled.split_whitespace().any(|item| item == controller) {
+        return Ok(());
+    }
+
+    let controllers = std::fs::read_to_string(cgroup.join("cgroup.controllers"))
+        .map_err(|err| format!("read cgroup controllers for {}: {err}", cgroup.display()))?;
+    if !controllers
+        .split_whitespace()
+        .any(|item| item == controller)
+    {
+        return Err(format!(
+            "the {controller} controller is not delegated to {}",
+            cgroup.display()
+        ));
+    }
+
+    write_cgroup_value(&subtree_control, &format!("+{controller}")).map_err(|err| {
+        format!(
+            "{err}; ensure the Herdr service uses Delegate=yes on a unified cgroup v2 hierarchy"
+        )
+    })
+}
+
+fn write_cgroup_value(path: &Path, value: &str) -> Result<(), String> {
+    std::fs::write(path, value).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn valid_agent_memory_scope(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope.len() <= 128
+        && scope
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 pub fn signal_processes(pids: &[u32], signal: Signal) {
     let sig = match signal {
         Signal::Hangup => libc::SIGHUP,
@@ -814,6 +1211,76 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn unified_cgroup_membership_parses_v2_path() {
+        assert_eq!(
+            unified_cgroup_path("0::/user.slice/herdr.service/.herdr-control\n"),
+            Some("/user.slice/herdr.service/.herdr-control")
+        );
+        assert_eq!(unified_cgroup_path("2:memory:/legacy\n"), None);
+    }
+
+    #[test]
+    fn agent_memory_scope_rejects_path_traversal() {
+        assert!(valid_agent_memory_scope("pane-42-1001"));
+        assert!(!valid_agent_memory_scope("../escape"));
+        assert!(!valid_agent_memory_scope("pane/escape"));
+        assert!(!valid_agent_memory_scope(""));
+    }
+
+    #[test]
+    fn agent_cgroup_migration_rescans_for_children_forked_during_migration() {
+        let snapshots = RefCell::new(VecDeque::from([vec![200], vec![200, 201], vec![200, 201]]));
+        let migrated = RefCell::new(HashSet::new());
+
+        migrate_agent_process_tree_with(
+            100,
+            |_| snapshots.borrow_mut().pop_front().unwrap_or_default(),
+            || Ok(migrated.borrow().clone()),
+            |pid| {
+                migrated.borrow_mut().insert(pid);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*migrated.borrow(), HashSet::from([200, 201]));
+    }
+
+    #[test]
+    fn agent_cgroup_migration_fails_if_the_tree_never_stabilizes() {
+        let snapshots = RefCell::new(VecDeque::from([
+            vec![200],
+            vec![200, 201],
+            vec![200, 201, 202],
+            vec![200, 201, 202, 203],
+            vec![200, 201, 202, 203, 204],
+        ]));
+
+        let err = migrate_agent_process_tree_with(
+            100,
+            |_| snapshots.borrow_mut().pop_front().unwrap_or_default(),
+            || Ok(HashSet::new()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("escaped migration"), "{err}");
+    }
+
+    #[test]
+    fn only_service_cgroups_are_eligible_for_live_root_evacuation() {
+        assert!(cgroup_is_service(Path::new(
+            "/sys/fs/cgroup/app.slice/herdr.service"
+        )));
+        assert!(cgroup_is_service(Path::new(
+            "/sys/fs/cgroup/app.slice/custom-herdr.service"
+        )));
+        assert!(!cgroup_is_service(Path::new(
+            "/sys/fs/cgroup/app.slice/kitty.scope"
+        )));
     }
 
     #[test]

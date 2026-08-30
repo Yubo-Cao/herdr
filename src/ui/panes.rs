@@ -359,6 +359,7 @@ pub(super) fn render_panes(
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             let show_cursor = info.is_focused
                 && terminal_active
+                && !app.pane_controlled_externally(ws_idx, info.id)
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
@@ -662,11 +663,44 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
-        let Some(title) = ws
-            .pane_state(info.id)
-            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
+        let Some(pane) = ws.pane_state(info.id) else {
+            continue;
+        };
+        let Some(terminal) = app.terminals.get(&pane.attached_terminal_id) else {
+            continue;
+        };
+        let mut label = terminal.border_label(app.show_agent_labels_on_pane_borders);
+        if let Some(pane_number) = ws.public_pane_number(info.id) {
+            let public_pane_id = crate::workspace::public_pane_id_for_number(&ws.id, pane_number);
+            let participants = app.collaboration.pane_participant_count(&public_pane_id);
+            let typing = app.collaboration.pane_typing_participants(&public_pane_id);
+            let presence = if typing.len() == 1 {
+                Some(format!("{} typing…", typing[0].display_name))
+            } else if typing.len() > 1 {
+                Some(format!("{} typing…", typing.len()))
+            } else if participants > 1 {
+                Some(format!("{participants} viewers"))
+            } else {
+                None
+            };
+            if let Some(presence) = presence {
+                label = Some(match label {
+                    Some(label) => format!("{label} · {presence}"),
+                    None => presence,
+                });
+            }
+        }
+        if app
+            .direct_attach_resize_locks
+            .contains(&pane.attached_terminal_id)
+        {
+            label = Some(match label {
+                Some(label) => format!("{label} · remote control"),
+                None => "remote control".to_owned(),
+            });
+        }
+        let Some(title) =
+            label.and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
         else {
             continue;
         };

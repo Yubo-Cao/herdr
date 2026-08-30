@@ -238,6 +238,10 @@ impl TerminalRuntime {
         self.0.reset_agent_detection();
     }
 
+    pub fn refresh_agent_memory_limit(&self) {
+        self.0.refresh_agent_memory_limit();
+    }
+
     #[cfg(test)]
     pub(crate) fn agent_detection_reset_notify_for_test(
         &self,

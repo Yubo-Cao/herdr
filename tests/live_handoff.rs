@@ -642,6 +642,78 @@ fn live_handoff_preserves_named_session_socket_paths() {
 }
 
 #[test]
+fn live_handoff_preserves_collaboration_leases_and_claims() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:collaboration:update",
+            "method": "collaboration.update",
+            "params": {
+                "participant_id": "browser-a",
+                "display_name": "Browser A",
+                "color": "#0969da",
+                "role": "editor",
+                "activity": "active",
+                "surface": "web",
+                "pane_id": "pane-a"
+            }
+        }),
+    ));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:collaboration:claim",
+            "method": "collaboration.claim",
+            "params": {
+                "participant_id": "browser-a",
+                "pane_id": "pane-a"
+            }
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let listed = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:collaboration:list",
+            "method": "collaboration.list",
+            "params": {}
+        }),
+    );
+    assert_ok(listed.clone());
+    assert_eq!(
+        listed["result"]["snapshot"]["participants"][0]["participant_id"],
+        "browser-a"
+    );
+    assert_eq!(
+        listed["result"]["snapshot"]["pane_claims"][0]["pane_id"],
+        "pane-a"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_ignores_leaked_default_socket_env_for_named_session() {
     let _lock = test_lock();
     let base = unique_test_dir();

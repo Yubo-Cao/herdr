@@ -1783,6 +1783,9 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return false;
         };
+        if self.pane_controlled_externally(ws_idx, info.id) {
+            return false;
+        }
         let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         else {
             return false;
@@ -1809,6 +1812,9 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return false;
         };
+        if self.pane_controlled_externally(ws_idx, info.id) {
+            return false;
+        }
         let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         else {
             return false;
@@ -1834,6 +1840,9 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return false;
         };
+        if self.pane_controlled_externally(ws_idx, info.id) {
+            return false;
+        }
         let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         else {
             return false;
@@ -1864,6 +1873,9 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return false;
         };
+        if self.pane_controlled_externally(ws_idx, info.id) {
+            return false;
+        }
         let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         else {
             return false;
@@ -2434,6 +2446,61 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    #[test]
+    fn clicking_remotely_controlled_pane_opens_takeover_menu() {
+        let mut app = app_for_mouse_test();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.direct_attach_resize_locks.insert(terminal_id);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.view.pane_infos[0].clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::PaneControl {
+                ws_idx: 0,
+                pane_id: target,
+            }) if *target == pane_id
+        ));
+        assert!(!app.state.request_takeover_focused_pane);
+    }
+
+    #[test]
+    fn shift_clicking_remotely_controlled_pane_requests_immediate_takeover() {
+        let mut app = app_for_mouse_test();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.direct_attach_resize_locks.insert(terminal_id);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.view.pane_infos[0].clone();
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: info.inner_rect.x + 1,
+            row: info.inner_rect.y + 1,
+            modifiers: KeyModifiers::SHIFT,
+        });
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.request_takeover_focused_pane);
     }
 
     #[tokio::test]

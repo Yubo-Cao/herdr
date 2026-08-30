@@ -113,11 +113,7 @@ herdr terminal attach term_abc123
 
 用 `ctrl+b q` 分离。用 `ctrl+b ctrl+b` 发送字面的 `ctrl+b`。
 
-一个终端只能有一个可写的直接附加客户端拥有输入和调整尺寸的权限。用 `--takeover` 替换现有的所有者:
-
-```bash
-herdr terminal attach term_abc123 --takeover
-```
+一个终端只能有一个可写的直接附加客户端拥有输入和调整尺寸的权限。直接附加是旧版的排他控制接口，因此附加时会替换现有控制者。
 
 ## 单进程逃生舱
 

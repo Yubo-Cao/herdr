@@ -18,6 +18,12 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentProcessUsage {
+    pub(crate) pids: Vec<u32>,
+    pub(crate) resident_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -67,6 +73,36 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
         direct_terminal_attach: cfg!(unix),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_agent_memory_controller() -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn apply_agent_memory_limit(
+    _existing_scope: Option<&str>,
+    _pane_id: u32,
+    _child_pid: u32,
+    _limit_bytes: u64,
+) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn disable_agent_memory_limit(_scope: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn cleanup_agent_memory_scope(_scope: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn agent_process_usage(_child_pid: u32) -> Option<AgentProcessUsage> {
+    None
 }
 
 #[cfg(not(windows))]

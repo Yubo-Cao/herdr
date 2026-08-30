@@ -5,8 +5,8 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
-    SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD,
-    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
+    DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -277,6 +277,24 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResourceConfig {
+    /// Maximum physical memory used by one Claude process tree. Zero disables the limit.
+    pub claude_memory_limit_bytes: u64,
+    /// Maximum physical memory used by one Codex process tree. Zero disables the limit.
+    pub codex_memory_limit_bytes: u64,
+}
+
+impl Default for ResourceConfig {
+    fn default() -> Self {
+        Self {
+            claude_memory_limit_bytes: DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
+            codex_memory_limit_bytes: DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
+        }
+    }
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
@@ -319,6 +337,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
+    pub resources: ResourceConfig,
     pub server: ServerConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
@@ -1234,6 +1253,33 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_config_defaults_and_parses_independent_agent_limits() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.resources.claude_memory_limit_bytes,
+            DEFAULT_AGENT_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            default_config.resources.codex_memory_limit_bytes,
+            DEFAULT_AGENT_MEMORY_LIMIT_BYTES
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[resources]
+claude_memory_limit_bytes = 0
+codex_memory_limit_bytes = 8589934592
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.resources.claude_memory_limit_bytes, 0);
+        assert_eq!(
+            config.resources.codex_memory_limit_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

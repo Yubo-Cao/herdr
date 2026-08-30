@@ -31,6 +31,24 @@
       ]
     },
     {
+      "id": "resources",
+      "title": "Resources",
+      "keys": [
+        {
+          "key": "resources.claude_memory_limit_bytes",
+          "type": "integer",
+          "default": "4294967296",
+          "description": "Maximum physical memory for one detected Claude process tree. Linux enforces this with cgroup v2 and permits at most the same amount of swap; macOS uses an RSS watchdog. Set to 0 to disable. Live config reload applies the new value to running panes."
+        },
+        {
+          "key": "resources.codex_memory_limit_bytes",
+          "type": "integer",
+          "default": "4294967296",
+          "description": "Maximum physical memory for one detected Codex process tree. Linux enforces this with cgroup v2 and permits at most the same amount of swap; macOS uses an RSS watchdog. Set to 0 to disable. Live config reload applies the new value to running panes."
+        }
+      ]
+    },
+    {
       "id": "theme",
       "title": "Theme",
       "keys": [

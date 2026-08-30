@@ -149,10 +149,6 @@ herdr agent attach reviewer
 
 マウスホイールまたは通常の page up/page down でスクロールします。通常の入力をすると最下部に戻ります。
 
-別のダイレクトアタッチクライアントがすでに入力を所有している場合は `--takeover` を使います:
-
-```bash
-herdr agent attach reviewer --takeover
-```
+エージェントへのダイレクトアタッチは従来の排他的制御インターフェースなので、アタッチすると現在そのターミナルを制御している別のクライアントを置き換えます。
 
 エージェントではないターミナルで同じダイレクトアタッチ挙動が欲しいときは `herdr terminal attach <terminal_id>` を使ってください。

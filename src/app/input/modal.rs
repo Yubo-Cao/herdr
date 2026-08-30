@@ -74,6 +74,7 @@ pub(super) fn modal_action_from_buttons<A: Copy>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalMenuAction {
+    TakePaneControl,
     Detach,
     WhatsNew,
     Keybinds,
@@ -82,11 +83,15 @@ pub(crate) enum GlobalMenuAction {
 }
 
 pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
-    let mut actions = vec![
+    let mut actions = Vec::new();
+    if state.focused_pane_controlled_externally() {
+        actions.push(GlobalMenuAction::TakePaneControl);
+    }
+    actions.extend([
         GlobalMenuAction::Settings,
         GlobalMenuAction::Keybinds,
         GlobalMenuAction::ReloadConfig,
-    ];
+    ]);
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
@@ -130,6 +135,10 @@ pub(super) fn request_detach(state: &mut AppState) {
 
 pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuAction) {
     match action {
+        GlobalMenuAction::TakePaneControl => {
+            state.request_takeover_focused_pane = true;
+            leave_modal(state);
+        }
         GlobalMenuAction::Detach => {
             leave_modal(state);
             request_detach(state);
@@ -1200,6 +1209,17 @@ impl App {
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
         let item = menu.items().get(idx).copied();
         match (menu.kind, item) {
+            (
+                ContextMenuKind::PaneControl { ws_idx, pane_id },
+                Some("Take control (Shift-click)"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                self.state.request_takeover_focused_pane = true;
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::PaneControl { .. }, Some("Keep watching")) => {
+                leave_modal(&mut self.state);
+            }
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
                 leave_modal(&mut self.state);
@@ -1540,6 +1560,31 @@ mod tests {
 
         assert!(state.should_quit);
         assert!(!state.detach_requested);
+    }
+
+    #[test]
+    fn global_menu_offers_and_requests_takeover_for_remotely_controlled_pane() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = Mode::Terminal;
+        let pane_id = state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.direct_attach_resize_locks.insert(terminal_id);
+
+        assert_eq!(
+            global_menu_actions(&state).first(),
+            Some(&GlobalMenuAction::TakePaneControl)
+        );
+
+        apply_global_menu_action(&mut state, GlobalMenuAction::TakePaneControl);
+
+        assert!(state.request_takeover_focused_pane);
+        assert_eq!(state.mode, Mode::Terminal);
     }
 
     #[test]

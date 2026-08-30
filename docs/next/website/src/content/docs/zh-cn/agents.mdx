@@ -149,10 +149,6 @@ herdr agent attach reviewer
 
 用鼠标滚轮或普通的 page up/page down 滚动。正常输入会跳回底部。
 
-如果另一个直接附加客户端已经拥有输入,用 `--takeover`:
-
-```bash
-herdr agent attach reviewer --takeover
-```
+直接附加智能体是旧版的排他控制接口，因此附加时会替换当前控制该终端的其他客户端。
 
 想对非智能体终端获得相同的直接附加行为时,用 `herdr terminal attach <terminal_id>`。

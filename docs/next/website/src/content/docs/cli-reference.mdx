@@ -332,6 +332,8 @@ herdr terminal title clear
 ```
 
 Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
+Direct attach is the legacy exclusive-control interface and replaces an existing
+controller. The `--takeover` flag remains accepted for command compatibility.
 `terminal session control` opens a writable live terminal stream for a pane,
 terminal, or agent target. It prints the same newline-delimited
 `terminal.frame` and `terminal.closed` records as observe mode. It reads
