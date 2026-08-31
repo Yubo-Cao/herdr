@@ -106,6 +106,16 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// What a memory limit did to one terminal's processes.
+///
+/// Kept after the fact so the pane header can still say "this was killed" once
+/// the notification has gone; a SIGKILLed tree leaves no other trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryIncident {
+    pub processes: u64,
+    pub limit_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
@@ -121,6 +131,9 @@ pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
+    /// Set when this terminal's process tree was killed for exceeding its
+    /// memory limit, and cleared once a new agent takes the pane over.
+    pub memory_incident: Option<MemoryIncident>,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
@@ -155,6 +168,7 @@ impl TerminalState {
             id,
             cwd,
             detected_agent: None,
+            memory_incident: None,
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
             fallback_observed_at: None,
@@ -189,6 +203,9 @@ impl TerminalState {
         agent: Agent,
         now: Instant,
     ) -> TerminalStateMutation {
+        // A fresh agent in this pane is a fresh start; the previous tree's
+        // headstone stays in the scrollback but the header stops mourning it.
+        self.memory_incident = None;
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
             && !self.detected_state_observed_before_release_suppression(Some(agent), now);
@@ -2110,7 +2127,7 @@ impl TerminalState {
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
-        self.effective_title().or_else(|| {
+        let label = self.effective_title().or_else(|| {
             self.manual_label.clone().or_else(|| {
                 show_agent_labels
                     .then(|| {
@@ -2119,6 +2136,20 @@ impl TerminalState {
                     })
                     .flatten()
             })
+        });
+        // The marker outlives the notification on purpose: someone who returns
+        // to a quiet pane an hour later still needs to know it was killed
+        // rather than finished.
+        let Some(incident) = self.memory_incident else {
+            return label;
+        };
+        let marker = format!(
+            "killed at {}",
+            crate::agent_resources::format_memory_limit(incident.limit_bytes)
+        );
+        Some(match label {
+            Some(label) => format!("{label} · {marker}"),
+            None => marker,
         })
     }
 
@@ -2177,6 +2208,44 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn a_killed_pane_says_so_in_its_border_label() {
+        let mut terminal = test_terminal();
+        terminal.manual_label = Some("build".to_string());
+        terminal.memory_incident = Some(MemoryIncident {
+            processes: 26,
+            limit_bytes: 12 * 1024 * 1024 * 1024,
+        });
+        assert_eq!(
+            terminal.border_label(true).as_deref(),
+            Some("build · killed at 12.0 GiB")
+        );
+    }
+
+    #[test]
+    fn a_killed_pane_with_no_other_label_still_says_so() {
+        let mut terminal = test_terminal();
+        terminal.memory_incident = Some(MemoryIncident {
+            processes: 1,
+            limit_bytes: 4 * 1024 * 1024 * 1024,
+        });
+        assert_eq!(
+            terminal.border_label(true).as_deref(),
+            Some("killed at 4.0 GiB")
+        );
+    }
+
+    #[test]
+    fn a_new_agent_clears_the_previous_tree_headstone_from_the_header() {
+        let mut terminal = test_terminal();
+        terminal.memory_incident = Some(MemoryIncident {
+            processes: 26,
+            limit_bytes: 12 * 1024 * 1024 * 1024,
+        });
+        terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+        assert_eq!(terminal.memory_incident, None);
     }
 
     fn test_session_path(name: &str) -> String {

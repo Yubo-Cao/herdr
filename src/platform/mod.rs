@@ -24,6 +24,20 @@ pub(crate) struct AgentProcessUsage {
     pub(crate) resident_bytes: u64,
 }
 
+/// A reading of one agent's kernel memory leaf.
+///
+/// The kernel enforces the limit on its own schedule, so the only way the
+/// server learns that a tree was throttled or killed is by reading these
+/// counters back. `oom_kills` and `limit_hits` are cumulative for the life of
+/// the leaf; callers compare successive samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AgentMemorySnapshot {
+    pub(crate) current_bytes: u64,
+    pub(crate) limit_bytes: u64,
+    pub(crate) oom_kills: u64,
+    pub(crate) limit_hits: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -86,8 +100,14 @@ pub(crate) fn apply_agent_memory_limit(
     _pane_id: u32,
     _child_pid: u32,
     _limit_bytes: u64,
+    _kill_tree: bool,
 ) -> Result<Option<String>, String> {
     Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn agent_memory_snapshot(_scope: &str) -> Option<AgentMemorySnapshot> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]

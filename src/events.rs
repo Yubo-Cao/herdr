@@ -62,6 +62,12 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
+    /// An agent process tree approached, or was killed at, its memory limit.
+    AgentMemoryNoticed {
+        pane_id: PaneId,
+        agent: Agent,
+        notice: crate::agent_resources::AgentMemoryNotice,
+    },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

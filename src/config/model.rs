@@ -6,7 +6,8 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
     SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
-    DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    DEFAULT_AGENT_MEMORY_WARN_PERCENT, DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES,
+    DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -284,6 +285,10 @@ pub struct ResourceConfig {
     pub claude_memory_limit_bytes: u64,
     /// Maximum physical memory used by one Codex process tree. Zero disables the limit.
     pub codex_memory_limit_bytes: u64,
+    /// Kill the entire agent process tree when it reaches its memory limit, instead of only its largest process.
+    pub kill_tree_on_memory_limit: bool,
+    /// Percentage of an agent's memory limit that raises a warning notification. Zero disables the warning.
+    pub memory_warn_percent: u8,
 }
 
 impl Default for ResourceConfig {
@@ -291,6 +296,12 @@ impl Default for ResourceConfig {
         Self {
             claude_memory_limit_bytes: DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
             codex_memory_limit_bytes: DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
+            // A group kill takes the agent CLI down with whatever actually
+            // overran, which reads as Herdr killing the agent at random. The
+            // kernel's single-victim choice loses the runaway build instead and
+            // leaves the agent alive to say so.
+            kill_tree_on_memory_limit: false,
+            memory_warn_percent: DEFAULT_AGENT_MEMORY_WARN_PERCENT,
         }
     }
 }

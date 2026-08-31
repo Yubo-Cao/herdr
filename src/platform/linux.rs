@@ -441,6 +441,7 @@ pub(crate) fn apply_agent_memory_limit(
     pane_id: u32,
     child_pid: u32,
     limit_bytes: u64,
+    kill_tree: bool,
 ) -> Result<Option<String>, String> {
     let paths = agent_memory_cgroup_paths()?;
     let scope = match existing_scope {
@@ -459,7 +460,16 @@ pub(crate) fn apply_agent_memory_limit(
         })
         .map_err(|err| format!("create {}: {err}", leaf.display()))?;
 
-    write_cgroup_value(&leaf.join("memory.oom.group"), "1")?;
+    // `memory.oom.group` decides who dies when the tree reaches its limit. With
+    // it set, the kernel kills every process in the leaf at once — including the
+    // agent CLI itself, which is what makes a runaway `pytest -n auto` or dev
+    // server look like Herdr killing the agent for no reason. Left off, the
+    // kernel picks the single fattest task instead, so the runaway dies and the
+    // agent survives to report it.
+    write_cgroup_value(
+        &leaf.join("memory.oom.group"),
+        if kill_tree { "1" } else { "0" },
+    )?;
     write_cgroup_value(&leaf.join("memory.max"), &limit_bytes.to_string())?;
     let swap_max = leaf.join("memory.swap.max");
     if swap_max.exists() {
@@ -552,6 +562,43 @@ pub(crate) fn disable_agent_memory_limit(scope: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Read back the kernel's own view of one agent leaf.
+///
+/// This is the only channel through which the server learns that a tree was
+/// throttled or killed: the kernel acts on its own schedule and reports after
+/// the fact. Everything here is best effort — the leaf disappears when the pane
+/// exits, and a missing counter file simply yields zero.
+pub(crate) fn agent_memory_snapshot(scope: &str) -> Option<super::AgentMemorySnapshot> {
+    let paths = agent_memory_cgroup_paths().ok()?;
+    if !valid_agent_memory_scope(scope) {
+        return None;
+    }
+    let leaf = paths.agents.join(scope);
+    let current_bytes = read_cgroup_u64(&leaf.join("memory.current"))?;
+    let events = std::fs::read_to_string(leaf.join("memory.events")).unwrap_or_default();
+    Some(super::AgentMemorySnapshot {
+        current_bytes,
+        // An unlimited leaf reports the literal `max`, which is not a number and
+        // correctly reads as "no limit to be near".
+        limit_bytes: read_cgroup_u64(&leaf.join("memory.max")).unwrap_or(0),
+        oom_kills: cgroup_event_count(&events, "oom_kill"),
+        limit_hits: cgroup_event_count(&events, "max"),
+    })
+}
+
+fn read_cgroup_u64(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn cgroup_event_count(events: &str, key: &str) -> u64 {
+    events
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 pub(crate) fn cleanup_agent_memory_scope(scope: &str) -> Result<(), String> {

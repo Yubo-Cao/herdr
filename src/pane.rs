@@ -241,6 +241,28 @@ async fn publish_agent_process_detected_event(
     }
 }
 
+async fn publish_agent_memory_notice(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    agent: Agent,
+    notice: crate::agent_resources::AgentMemoryNotice,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::AgentMemoryNoticed {
+            pane_id,
+            agent,
+            notice,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver AgentMemoryNoticed event"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
     state: AgentState,
@@ -694,6 +716,8 @@ fn spawn_basic_detection_task(
     full_lifecycle_authority_active: Arc<AtomicBool>,
     resource_controller: Arc<crate::agent_resources::PaneResourceController>,
     state_events: mpsc::Sender<AppEvent>,
+    render_notify: Arc<Notify>,
+    render_dirty: Arc<RenderSignal>,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
@@ -872,7 +896,15 @@ fn spawn_basic_detection_task(
                 && agent.is_some()
                 && !foreground_shell_exit_reported;
 
-            resource_controller.enforce_watchdog();
+            if let Some((agent, notice)) = resource_controller.poll_memory() {
+                if let Some(headstone) = crate::agent_resources::tombstone_line(agent, notice) {
+                    if terminal.write_local_notice(&headstone) && render_dirty.request_pty(pane_id)
+                    {
+                        render_notify.notify_one();
+                    }
+                }
+                publish_agent_memory_notice(state_events.clone(), pane_id, agent, notice).await;
+            }
 
             if lifecycle_authority_active && !process_exited {
                 pending_idle.clear();
@@ -2018,6 +2050,8 @@ impl PaneRuntime {
             full_lifecycle_authority_active.clone(),
             resource_controller.clone(),
             events,
+            render_notify.clone(),
+            render_dirty.clone(),
         );
 
         Ok(Self {
@@ -2466,7 +2500,19 @@ impl PaneRuntime {
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
 
-                    resource_controller_for_task.enforce_watchdog();
+                    if let Some((agent, notice)) = resource_controller_for_task.poll_memory() {
+                        if let Some(headstone) =
+                            crate::agent_resources::tombstone_line(agent, notice)
+                        {
+                            if terminal.write_local_notice(&headstone)
+                                && render_dirty.request_pty(pane_id)
+                            {
+                                render_notify.notify_one();
+                            }
+                        }
+                        publish_agent_memory_notice(state_events.clone(), pane_id, agent, notice)
+                            .await;
+                    }
 
                     if lifecycle_authority_active && !process_exited {
                         pending_idle.clear();

@@ -2782,6 +2782,14 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::AgentMemoryNoticed {
+                pane_id,
+                agent,
+                notice,
+            } => {
+                self.raise_agent_memory_toast(pane_id, agent, notice);
+                Vec::new()
+            }
             AppEvent::AgentProcessDetected {
                 pane_id,
                 agent,
@@ -3202,6 +3210,109 @@ impl AppState {
             },
         );
         None
+    }
+
+    /// Surface what the kernel already did to an agent's process tree.
+    ///
+    /// A cgroup kill is invisible from inside the pane: the shell simply loses
+    /// its children, with no exit status and nothing on screen. This toast is
+    /// the only place the user is told that a limit, not a bug, ended the work.
+    fn raise_agent_memory_toast(
+        &mut self,
+        pane_id: PaneId,
+        agent: Agent,
+        notice: crate::agent_resources::AgentMemoryNotice,
+    ) {
+        use crate::agent_resources::AgentMemoryNotice;
+
+        let Some(ws_idx) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.pane_state(pane_id).is_some())
+        else {
+            return;
+        };
+        if let AgentMemoryNotice::Killed {
+            processes,
+            limit_bytes,
+        } = notice
+        {
+            if let Some(terminal_id) = self.workspaces[ws_idx]
+                .pane_state(pane_id)
+                .map(|pane| pane.attached_terminal_id.clone())
+            {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.memory_incident = Some(crate::terminal::MemoryIncident {
+                        processes,
+                        limit_bytes,
+                    });
+                }
+            }
+        }
+
+        let label = crate::detect::agent_label(agent);
+        let (kind, title) = match notice {
+            AgentMemoryNotice::Killed {
+                processes,
+                limit_bytes,
+            } => (
+                ToastKind::NeedsAttention,
+                format!(
+                    "{label} hit its {} memory limit — the kernel killed {processes} process{}",
+                    crate::agent_resources::format_memory_limit(limit_bytes),
+                    if processes == 1 { "" } else { "es" }
+                ),
+            ),
+            AgentMemoryNotice::WatchdogTerminated { limit_bytes, .. } => (
+                ToastKind::NeedsAttention,
+                format!(
+                    "{label} exceeded its {} memory limit — its process tree was terminated",
+                    crate::agent_resources::format_memory_limit(limit_bytes)
+                ),
+            ),
+            AgentMemoryNotice::Pressure {
+                used_bytes,
+                limit_bytes,
+            } => (
+                ToastKind::UpdateInstalled,
+                format!(
+                    "{label} is using {} of its {} memory limit",
+                    crate::agent_resources::format_memory_limit(used_bytes),
+                    crate::agent_resources::format_memory_limit(limit_bytes)
+                ),
+            ),
+        };
+
+        let workspace_label = self.workspaces[ws_idx].display_name_from_terminals(&self.terminals);
+        let context =
+            notification_context(&self.workspaces[ws_idx], &workspace_label, ws_idx, pane_id);
+        let workspace_id = self.workspaces[ws_idx].id.clone();
+
+        // Follow the same delivery choice as every other notification: an
+        // in-app toast is invisible to someone whose config sends notifications
+        // to the desktop, which is exactly the person who walked away and needs
+        // to be told. The headstone in the pane is written either way.
+        match self.toast_config.delivery {
+            crate::config::ToastDelivery::Off => {}
+            crate::config::ToastDelivery::Herdr => {
+                self.toast = Some(ToastNotification {
+                    kind,
+                    title,
+                    context,
+                    position: None,
+                    target: Some(ToastTarget {
+                        workspace_id,
+                        pane_id,
+                    }),
+                });
+            }
+            crate::config::ToastDelivery::Terminal => {
+                let _ = crate::terminal_notify::show_notification(&title, Some(&context));
+            }
+            crate::config::ToastDelivery::System => {
+                let _ = crate::platform::show_desktop_notification(&title, Some(&context));
+            }
+        }
     }
 
     fn agent_notification_delivery(

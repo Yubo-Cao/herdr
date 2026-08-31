@@ -45,6 +45,18 @@
           "type": "integer",
           "default": "4294967296",
           "description": "Maximum physical memory for one detected Codex process tree. Linux enforces this with cgroup v2 and permits at most the same amount of swap; macOS uses an RSS watchdog. Set to 0 to disable. Live config reload applies the new value to running panes."
+        },
+        {
+          "key": "resources.kill_tree_on_memory_limit",
+          "type": "boolean",
+          "default": "false",
+          "description": "Kill an agent's entire process tree when it reaches its memory limit. Left off, the kernel ends only the largest process in the tree, so a runaway build or test run dies while the agent itself keeps running and can report what happened. Linux only."
+        },
+        {
+          "key": "resources.memory_warn_percent",
+          "type": "integer",
+          "default": "80",
+          "description": "Percentage of an agent's memory limit that raises a warning notification before the limit is reached. Set to 0 to disable the warning. Linux only."
         }
       ]
     },

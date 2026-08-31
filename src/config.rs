@@ -56,6 +56,7 @@ pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
 pub const DEFAULT_AGENT_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_AGENT_MEMORY_WARN_PERCENT: u8 = 80;
 
 #[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {

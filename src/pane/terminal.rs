@@ -526,6 +526,10 @@ impl PaneTerminal {
             .maybe_restore_host_terminal_theme(pane_id, shell_pid)
     }
 
+    pub fn write_local_notice(&self, text: &str) -> bool {
+        self.ghostty.write_local_notice(text)
+    }
+
     pub fn terminal_title(&self) -> Option<String> {
         self.ghostty.terminal_title()
     }
@@ -1140,6 +1144,20 @@ impl GhosttyPaneTerminal {
             .lock()
             .map(|core| core.transient_default_color_owner_pgid.is_some())
             .unwrap_or(false)
+    }
+
+    /// Write server-authored text into the pane's own screen.
+    ///
+    /// This deliberately bypasses the PTY: the text is for the person reading
+    /// the pane, and sending it to the child would type it at whatever is
+    /// running there instead. It is only ever used for a message about
+    /// something that has already happened to that pane's processes.
+    pub fn write_local_notice(&self, text: &str) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        core.terminal.write(text.as_bytes());
+        true
     }
 
     pub fn maybe_restore_host_terminal_theme(&self, pane_id: PaneId, shell_pid: u32) -> bool {

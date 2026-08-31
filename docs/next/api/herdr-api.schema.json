@@ -978,6 +978,17 @@
                 "null"
               ]
             },
+            "memory_incident": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneMemoryIncident"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present when this pane's process tree was killed for exceeding its\nmemory limit, until a new agent takes the pane over."
+            },
             "pane_id": {
               "type": "string"
             },
@@ -1167,6 +1178,28 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneMemoryIncident": {
+          "description": "What a memory limit did to a pane's process tree.\n\nA killed tree leaves no exit status and no output, so this is how a client\ntells \"the agent finished\" apart from \"the agent was killed\".",
+          "properties": {
+            "limit_bytes": {
+              "description": "The memory limit the tree reached, in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "processes": {
+              "description": "How many processes the kernel killed in this pane's tree.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "processes",
+            "limit_bytes"
           ],
           "type": "object"
         },
@@ -8041,6 +8074,17 @@
                 "null"
               ]
             },
+            "memory_incident": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneMemoryIncident"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present when this pane's process tree was killed for exceeding its\nmemory limit, until a new agent takes the pane over."
+            },
             "pane_id": {
               "type": "string"
             },
@@ -8230,6 +8274,28 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneMemoryIncident": {
+          "description": "What a memory limit did to a pane's process tree.\n\nA killed tree leaves no exit status and no output, so this is how a client\ntells \"the agent finished\" apart from \"the agent was killed\".",
+          "properties": {
+            "limit_bytes": {
+              "description": "The memory limit the tree reached, in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "processes": {
+              "description": "How many processes the kernel killed in this pane's tree.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "processes",
+            "limit_bytes"
           ],
           "type": "object"
         },

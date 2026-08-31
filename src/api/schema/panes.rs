@@ -443,6 +443,18 @@ pub struct PaneReleaseAgentParams {
     pub seq: Option<u64>,
 }
 
+/// What a memory limit did to a pane's process tree.
+///
+/// A killed tree leaves no exit status and no output, so this is how a client
+/// tells "the agent finished" apart from "the agent was killed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneMemoryIncident {
+    /// How many processes the kernel killed in this pane's tree.
+    pub processes: u64,
+    /// The memory limit the tree reached, in bytes.
+    pub limit_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -467,6 +479,10 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Present when this pane's process tree was killed for exceeding its
+    /// memory limit, until a new agent takes the pane over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_incident: Option<PaneMemoryIncident>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
