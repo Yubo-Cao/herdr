@@ -8,6 +8,8 @@ use super::claude_settings::{
     install as install_claude_settings, uninstall as uninstall_claude_settings,
 };
 use super::command::hook_command;
+#[cfg(windows)]
+use super::command::powershell_encoded_hook_command;
 #[cfg(not(windows))]
 use super::command::shell_single_quote;
 use super::config_edit::{
@@ -20,13 +22,14 @@ use super::config_edit::{
 use super::env::{
     antigravity_cli_dir, claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir,
     grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir, omp_extension_dir,
-    opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
+    opencode_dir, opencode_state_dir, pi_extension_dir, qodercli_dir, qwen_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
 };
 use super::opencode_config::{
-    add_tui_plugin, remove_tui_plugin, tui_config_path, validate_tui_plugin_config,
+    add_cli_plugin, add_tui_plugin, remove_cli_plugin, remove_tui_plugin, tui_config_path,
+    validate_tui_plugin_config,
 };
 use super::types::{
     AntigravityCliInstallPaths, AntigravityCliUninstallResult, ClaudeInstallPaths,
@@ -466,11 +469,20 @@ pub(crate) fn install_opencode() -> io::Result<OpenCodeInstallPaths> {
     let tui_plugin_path = dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME);
     fs::write(&tui_plugin_path, OPENCODE_TUI_PLUGIN_ASSET)?;
     let tui_config_path = add_tui_plugin(&dir, OPENCODE_TUI_PLUGIN_SPEC)?;
+    let v2_dir = dir.join(super::OPENCODE_V2_TUI_PLUGIN_DIR);
+    fs::create_dir_all(&v2_dir)?;
+    fs::write(v2_dir.join("tui.js"), super::OPENCODE_V2_TUI_PLUGIN_ASSET)?;
+    let cli_config_path = add_cli_plugin(
+        &dir,
+        &opencode_state_dir()?,
+        super::OPENCODE_V2_TUI_PLUGIN_SPEC,
+    )?;
 
     Ok(OpenCodeInstallPaths {
         plugin_path,
         tui_plugin_path,
         tui_config_path,
+        cli_config_path,
     })
 }
 
@@ -819,6 +831,15 @@ pub(crate) fn uninstall_opencode() -> io::Result<OpenCodeUninstallResult> {
     let plugin_path = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
     let tui_plugin_path = dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME);
     let mut errors = Vec::new();
+    remove_cli_plugin(&dir, super::OPENCODE_V2_TUI_PLUGIN_SPEC).unwrap_or_else(|err| {
+        errors.push(err.to_string());
+        false
+    });
+    let v2_dir = dir.join(super::OPENCODE_V2_TUI_PLUGIN_DIR);
+    remove_dir_all_if_exists(&v2_dir).unwrap_or_else(|err| {
+        errors.push(format!("failed to remove {}: {err}", v2_dir.display()));
+        false
+    });
     let updated_tui_config =
         remove_tui_plugin(&dir, OPENCODE_TUI_PLUGIN_SPEC).unwrap_or_else(|err| {
             errors.push(err.to_string());
@@ -1190,16 +1211,7 @@ pub(crate) fn uninstall_cursor() -> io::Result<CursorUninstallResult> {
 pub(crate) fn mastracode_hook_command(hook_path: &Path, action: &str) -> String {
     #[cfg(windows)]
     {
-        use base64::Engine;
-
-        let path = hook_path.display().to_string().replace('\'', "''");
-        let script = format!("& '{path}' {action}");
-        let encoded_script = script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(encoded_script);
-        format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+        powershell_encoded_hook_command(hook_path, action)
     }
     #[cfg(not(windows))]
     {
@@ -1349,6 +1361,17 @@ pub(crate) fn install_antigravity_cli() -> io::Result<AntigravityCliInstallPaths
     })
 }
 
+pub(crate) fn antigravity_cli_hook_command(hook_path: &Path, action: &str) -> String {
+    #[cfg(windows)]
+    {
+        powershell_encoded_hook_command(hook_path, action)
+    }
+    #[cfg(not(windows))]
+    {
+        hook_command(hook_path, Some(action))
+    }
+}
+
 /// Builds the Herdr-owned `hooks.json` block for Antigravity CLI.
 ///
 /// Every event Herdr registers takes a flat handler list; the `matcher`/`hooks`
@@ -1358,7 +1381,7 @@ fn antigravity_cli_hook_block(hook_path: &Path) -> Value {
     for (event, action) in ANTIGRAVITY_CLI_HOOK_EVENTS {
         let handler = json!({
             "type": "command",
-            "command": hook_command(hook_path, Some(action)),
+            "command": antigravity_cli_hook_command(hook_path, action),
             "timeout": ANTIGRAVITY_CLI_HOOK_TIMEOUT_SEC,
         });
         block.insert(event.to_string(), json!([handler]));

@@ -146,6 +146,7 @@ pub struct TerminalState {
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
+    managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -181,6 +182,7 @@ impl TerminalState {
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
+            managed_agent_launch_session: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -1346,6 +1348,7 @@ impl TerminalState {
                 | ("herdr:hermes", "hermes", Some("startup" | "new" | "resume"))
                 | ("herdr:opencode", "opencode", Some("select"))
                 | ("herdr:pi", "pi", Some("new" | "resume" | "fork"))
+                | ("herdr:grok", "grok", Some("new"))
                 | (
                     "herdr:omp",
                     "omp",
@@ -1382,6 +1385,14 @@ impl TerminalState {
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session);
+    }
+
+    pub fn set_managed_agent_launch_session(
+        &mut self,
+        session: crate::agent_resume::PersistedAgentSession,
+    ) {
+        self.persisted_agent_session = Some(session.clone());
+        self.managed_agent_launch_session = Some(session);
     }
 
     pub fn set_agent_session_ref(
@@ -1604,11 +1615,15 @@ impl TerminalState {
             self.hook_authority = None;
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
-        self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+        let persisted_session = crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
             session_ref,
-        });
+        };
+        if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
+            self.managed_agent_launch_session = None;
+        }
+        self.persisted_agent_session = Some(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -1638,7 +1653,8 @@ impl TerminalState {
         session_ref: &crate::agent_resume::AgentSessionRef,
         session_start_source: Option<&str>,
     ) -> bool {
-        Self::session_start_source_is_recognized(session_start_source)
+        (source, agent_label) != ("herdr:grok", "grok")
+            && Self::session_start_source_is_recognized(session_start_source)
             && self.foreground_agent_confirms_session_owner(source, agent_label, session_ref)
     }
 
@@ -1989,6 +2005,7 @@ impl TerminalState {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Active,
                 });
+                self.managed_agent_launch_session = None;
                 return true;
             }
             return false;
@@ -2016,6 +2033,7 @@ impl TerminalState {
                         kind: managed.kind,
                         phase: ManagedAgentPhase::Active,
                     });
+                    self.managed_agent_launch_session = None;
                     return true;
                 }
                 if ready_after.is_some() {
@@ -2058,6 +2076,14 @@ impl TerminalState {
     }
 
     pub fn clear_agent_name(&mut self) {
+        if self
+            .managed_agent_launch_session
+            .take()
+            .as_ref()
+            .is_some_and(|session| self.persisted_agent_session.as_ref() == Some(session))
+        {
+            self.persisted_agent_session = None;
+        }
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
@@ -2338,9 +2364,15 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(20),
         );
+        timed_out.set_managed_agent_launch_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+        });
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
         assert_eq!(timed_out.managed_agent_kind(), None);
+        assert!(timed_out.persisted_agent_session.is_none());
     }
 
     #[test]
@@ -4692,6 +4724,38 @@ mod tests {
     }
 
     #[test]
+    fn grok_new_session_ref_replaces_existing_session_ref() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_agent_session_ref(
+                "herdr:grok".into(),
+                "grok".into(),
+                crate::agent_resume::AgentSessionRef::id("grok-old"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:grok".into(),
+                "grok".into(),
+                crate::agent_resume::AgentSessionRef::id("grok-new"),
+                Some(21),
+                Some("new".into()),
+            )
+            .expect("new should replace the grok session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("grok-new")
+        );
+    }
+
+    #[test]
     fn opencode_server_new_does_not_replace_existing_session_ref() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
@@ -4822,6 +4886,60 @@ mod tests {
         assert!(!terminal
             .hook_report_sequences
             .contains_key("herdr:opencode"));
+    }
+
+    #[test]
+    fn opencode_child_prompt_reports_with_root_id_preserve_lifecycle_authority() {
+        let mut terminal = test_terminal();
+        let root = crate::agent_resume::AgentSessionRef::id("opencode-root").unwrap();
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::OpenCode,
+            "herdr:opencode",
+            "opencode",
+            root.clone(),
+        );
+
+        // The plugin projects child permission/question events onto their root.
+        for (seq, state) in [
+            (20, AgentState::Working),
+            (21, AgentState::Blocked),
+            (22, AgentState::Working),
+            (23, AgentState::Idle),
+        ] {
+            let mutation = terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:opencode".into(),
+                    "opencode".into(),
+                    state,
+                    None,
+                    Some(root.clone()),
+                    Some(seq),
+                )
+                .expect("root-scoped lifecycle report should be accepted");
+            assert!(!mutation.session_ref_changed);
+            assert_eq!(terminal.state, state);
+            assert_eq!(
+                terminal
+                    .hook_authority
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .as_ref(),
+                Some(&root)
+            );
+        }
+
+        let foreign_child_prompt = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Blocked,
+            None,
+            crate::agent_resume::AgentSessionRef::id("opencode-other-root"),
+            Some(24),
+        );
+        assert!(foreign_child_prompt.is_none());
+        assert_eq!(terminal.state, AgentState::Idle);
     }
 
     #[test]
@@ -5087,6 +5205,35 @@ mod tests {
                 session.session_ref.value.as_str()
             )),
             Some(("herdr:droid", "droid", "droid-session"))
+        );
+    }
+
+    #[test]
+    fn grok_new_session_does_not_replace_a_different_owner() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+        });
+        terminal.set_detected_state(Some(Agent::Grok), AgentState::Idle);
+
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:grok".into(),
+            "grok".into(),
+            crate::agent_resume::AgentSessionRef::id("grok-session"),
+            Some(21),
+            Some("new".into()),
+        );
+
+        assert!(mutation.is_none());
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref().map(|session| (
+                session.source.as_str(),
+                session.agent.as_str(),
+                session.session_ref.value.as_str()
+            )),
+            Some(("herdr:claude", "claude", "claude-session"))
         );
     }
 
