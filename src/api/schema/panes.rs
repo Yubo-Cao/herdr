@@ -547,6 +547,8 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -777,4 +779,12 @@ pub struct PaneReadResult {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+}
+
+/// Inclusive display-cell columns on a pane's current viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLinkRegion {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
 }

@@ -274,6 +274,10 @@ impl TerminalRuntime {
         self.0.scroll_reset();
     }
 
+    pub fn clear_screen(&self) -> Result<(), String> {
+        self.0.clear_screen()
+    }
+
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         self.0.set_scroll_offset_from_bottom(lines);
     }
@@ -352,6 +356,10 @@ impl TerminalRuntime {
         self.0.synchronized_output_active()
     }
 
+    pub(crate) fn synchronized_output_state(&self) -> (bool, u64) {
+        self.0.synchronized_output_state()
+    }
+
     pub fn visible_text(&self) -> String {
         self.0.visible_text()
     }
@@ -425,6 +433,19 @@ impl TerminalRuntime {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.0.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.0.link_regions_at(col, row, resolve)
+    }
+
+    pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
+        self.0.link_target_at(col, row)
     }
 
     pub fn kitty_image_placements_with_data_filter<F>(
@@ -547,6 +568,10 @@ impl TerminalRuntime {
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         self.0.cwd()
+    }
+
+    pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
+        self.0.cwd_for_persistence()
     }
 
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {

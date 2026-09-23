@@ -34,6 +34,9 @@ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const REMOTE_OUTPUT_READY_MARKER: &str = "herdr-remote-output-ready:1";
+const WINDOWS_REMOTE_PATH_MARKER: &str = "herdr-remote-path:1:";
+const WINDOWS_REMOTE_INSTALL_DIR_MARKER: &str = "herdr-remote-install-dir:1:";
+const WINDOWS_REMOTE_INSTALL_RESULT_MARKER: &str = "herdr-remote-install-result:1:";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
@@ -83,7 +86,43 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
-pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<()> {
+pub(crate) fn check_saved_ssh(target: &str, session: &str) -> io::Result<()> {
+    super::validate_remote_target(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    crate::session::validate_name(session)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut ssh = RemoteSsh::new_noninteractive(target.to_owned());
+    ssh.session_name = session.to_owned();
+    let remote = find_installed_remote_herdr(&ssh)?;
+    match remote_server_status(&ssh, &remote, false)? {
+        RemoteServerStatus::Running {
+            endpoint_protocol_generation,
+            surface_interest,
+            health_check,
+            detached_server_daemon,
+            ..
+        } if remote_server_restart_reason(
+            endpoint_protocol_generation,
+            detached_server_daemon,
+            true,
+            surface_interest,
+            health_check,
+        )
+        .is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(io::Error::other(format!(
+            "remote Herdr server is stopped or incompatible; run `{}`",
+            super::saved_ssh_bootstrap_command(target, session),
+        ))),
+    }
+}
+
+pub(crate) fn prepare_saved_ssh(
+    target: &str,
+    session_name: &str,
+) -> io::Result<Option<crate::client::endpoint::SshMachineMetadata>> {
     super::validate_remote_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     crate::session::validate_name(session_name)
@@ -132,7 +171,13 @@ pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<
         )
         .is_none() =>
         {
-            Ok(())
+            Ok(prepared.remote_herdr.machine_metadata().or_else(|| {
+                discover_remote_api_metadata(&ssh, session_name)
+                    .inspect_err(
+                        |error| tracing::debug!(%error, "could not capture SSH setup metadata"),
+                    )
+                    .ok()
+            }))
         }
         _ => Err(io::Error::other(
             "remote server is not ready for saved machines",
@@ -255,7 +300,16 @@ impl RemoteExecutable {
     }
 
     fn bridge_command(&self, session_name: &str) -> String {
-        let args = Self::session_args(session_name, &["remote-client-bridge"]);
+        self.bridge_command_with_idle_timeout(session_name, false)
+    }
+
+    fn bridge_command_with_idle_timeout(&self, session_name: &str, idle_timeout: bool) -> String {
+        let command = if idle_timeout {
+            &["remote-client-bridge", "--idle-timeout-v1"][..]
+        } else {
+            &["remote-client-bridge"][..]
+        };
+        let args = Self::session_args(session_name, command);
         match self {
             Self::PosixShellPath(_) => {
                 posix_remote_output_command(&format!("exec {}", self.command(&args)))
@@ -306,10 +360,21 @@ impl RemoteExecutable {
 pub(super) struct RemoteHerdr {
     install_suffix: String,
     executable: RemoteExecutable,
+    resolved_executable: Option<String>,
     platform: RemotePlatform,
+    bridge_idle_timeout: bool,
 }
 
 impl RemoteHerdr {
+    pub(super) fn machine_metadata(&self) -> Option<crate::client::endpoint::SshMachineMetadata> {
+        let executable = self.resolved_executable.clone()?;
+        let metadata = crate::client::endpoint::SshMachineMetadata {
+            os: self.platform.os.to_owned(),
+            executable,
+        };
+        metadata.is_valid().then_some(metadata)
+    }
+
     fn for_platform(platform: RemotePlatform) -> Self {
         let (install_suffix, executable) = if platform.is_windows() {
             (
@@ -324,12 +389,21 @@ impl RemoteHerdr {
         Self {
             install_suffix,
             executable,
+            resolved_executable: None,
             platform,
+            bridge_idle_timeout: false,
         }
     }
 
-    fn with_shell_path(mut self, shell_path: String) -> Self {
-        self.executable = RemoteExecutable::PosixShellPath(shell_path);
+    fn with_posix_path(mut self, path: &str) -> Self {
+        self.executable = RemoteExecutable::PosixShellPath(shell_quote(path));
+        self.resolved_executable = Some(path.to_owned());
+        self
+    }
+
+    fn with_windows_path(mut self, path: String) -> Self {
+        self.resolved_executable = Some(path.clone());
+        self.executable = RemoteExecutable::WindowsPath(path);
         self
     }
 }
@@ -345,6 +419,10 @@ fn windows_powershell_application_script(path: &str, args: &[&str]) -> String {
 }
 
 fn windows_powershell_streaming_application_command(path: &str, args: &[&str]) -> String {
+    windows_powershell_script_command(&windows_powershell_streaming_application_script(path, args))
+}
+
+fn windows_powershell_streaming_application_script(path: &str, args: &[&str]) -> String {
     let command_line = args
         .iter()
         .map(|arg| crate::platform::quote_windows_command_line_arg(arg))
@@ -352,11 +430,11 @@ fn windows_powershell_streaming_application_command(path: &str, args: &[&str]) -
         .join(" ");
     // Start-Process -Wait waits for descendants, including a cold-started server.
     // Retain the handle so Windows PowerShell 5.1 keeps the application's exit code.
-    windows_powershell_script_command(&format!(
+    format!(
         "$process = Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -PassThru -ErrorAction Stop; $null = $process.Handle; $process.WaitForExit(); exit $process.ExitCode",
         crate::platform::quote_powershell_arg(path),
         crate::platform::quote_powershell_arg(&command_line),
-    ))
+    )
 }
 
 fn posix_remote_output_command(command: &str) -> String {
@@ -509,17 +587,92 @@ pub(super) struct PreparedRemoteHerdr {
 pub(super) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
+    // Bridge workers may launch SSH after the helper that created this config
+    // has gone away. The last options owner removes only the temporary config.
+    _directory: Arc<ManagedSshConfigDirectory>,
 }
 
 struct ManagedSshConfig {
     options: ManagedSshOptions,
 }
 
-impl Drop for ManagedSshConfig {
+struct ManagedSshConfigDirectory(PathBuf);
+
+impl Drop for ManagedSshConfigDirectory {
     fn drop(&mut self) {
-        if let Some(dir) = self.options.config_path.parent() {
-            let _ = fs::remove_dir_all(dir);
-        }
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Classify only SSH authentication diagnostics, not transport failures or
+/// unknown/changed host keys. This does not imply permission to prompt.
+pub(crate) fn ssh_error_requires_authentication(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("host key verification failed")
+        || message.contains("remote host identification has changed")
+    {
+        return false;
+    }
+    (message.contains("permission denied")
+        && ["(publickey", "(keyboard-interactive", "(password"]
+            .iter()
+            .any(|method| message.contains(method)))
+        || (message.contains("signing failed")
+            && (message.contains("sign_and_send_pubkey") || message.contains("agent")))
+}
+
+/// Keep this owner alive until the child has exited: OpenSSH reads its temporary
+/// config after spawn. Dropping it never stops the shared authenticated master.
+pub(crate) struct SshAuthenticationCommand {
+    pub(crate) command: Command,
+    _config: ManagedSshConfig,
+}
+
+pub(crate) fn ssh_authentication_command(target: &str) -> io::Result<SshAuthenticationCommand> {
+    if target.is_empty() || target.starts_with('-') || target.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SSH target",
+        ));
+    }
+    if !crate::platform::remote_ssh_config_paths().multiplexing {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform"));
+    }
+    if !crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "interactive SSH recovery requires remote.manage_ssh_config=true",
+        ));
+    }
+    let config = write_managed_ssh_config(target)?;
+    Ok(authentication_command_with_config(target, config))
+}
+
+fn authentication_command_with_config(
+    target: &str,
+    config: ManagedSshConfig,
+) -> SshAuthenticationCommand {
+    let mut command = Command::new("ssh");
+    apply_managed_ssh_options(&mut command, Some(&config.options));
+    command
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("SSH_ASKPASS")
+        .arg("-o")
+        .arg("BatchMode=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=3")
+        .arg("-T")
+        .arg(target)
+        .arg("exit");
+    SshAuthenticationCommand {
+        command,
+        _config: config,
     }
 }
 
@@ -533,7 +686,7 @@ pub(super) struct RemoteSsh {
 impl RemoteSsh {
     fn new(target: String, manage_ssh_config: bool, session_name: String) -> Self {
         let managed_config = if manage_ssh_config {
-            write_managed_ssh_config()
+            write_managed_ssh_config(&target)
                 .inspect_err(|err| {
                     tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
                 })
@@ -551,12 +704,14 @@ impl RemoteSsh {
     }
 
     pub(super) fn new_noninteractive(target: String) -> Self {
-        Self {
-            target,
-            session_name: crate::session::DEFAULT_SESSION_NAME.into(),
-            managed_config: None,
-            noninteractive: true,
-        }
+        let manage = crate::platform::remote_ssh_config_paths().multiplexing
+            && crate::config::Config::load()
+                .config
+                .remote
+                .manage_ssh_config;
+        let mut ssh = Self::new(target, manage, crate::session::DEFAULT_SESSION_NAME.into());
+        ssh.noninteractive = true;
+        ssh
     }
 
     fn target(&self) -> &str {
@@ -583,6 +738,12 @@ impl RemoteSsh {
     fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
         apply_managed_ssh_options(&mut command, self.options());
+        command
+    }
+
+    fn scp_command(&self) -> Command {
+        let mut command = Command::new("scp");
+        apply_managed_scp_options(&mut command, self.options());
         command
     }
 
@@ -687,6 +848,86 @@ impl RemoteSsh {
                 "remote install exited with {status}"
             )))
         }
+    }
+
+    fn copy_windows_file(&self, source_path: &Path, remote_path: &str) -> io::Result<()> {
+        let status = self
+            .scp_command()
+            .arg(source_path)
+            .arg(windows_scp_target(&self.target, remote_path))
+            .status()
+            .map_err(|err| io::Error::new(err.kind(), format!("failed to start scp: {err}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("scp exited with {status}")))
+        }
+    }
+
+    fn install_windows_herdr(
+        &self,
+        remote_herdr: &RemoteHerdr,
+        source_path: &Path,
+        identity: &str,
+        sha256: &str,
+    ) -> io::Result<RemoteHerdr> {
+        let installer_dir = private_download_dir("windows-installer")?;
+        let local_installer_path = installer_dir.join("install.ps1");
+        if let Err(err) = fs::write(&local_installer_path, crate::update::WINDOWS_INSTALLER) {
+            let _ = fs::remove_dir_all(&installer_dir);
+            return Err(err);
+        }
+
+        let result = (|| {
+            let output = self.framed_user_shell_output(&windows_remote_install_prepare_command())?;
+            if !output.status.success() {
+                return Err(command_failed("remote install preparation failed", &output));
+            }
+            let remote_dir = parse_windows_remote_path(
+                &String::from_utf8_lossy(&output.stdout),
+                WINDOWS_REMOTE_INSTALL_DIR_MARKER,
+            )?;
+            let install_result = (|| {
+                self.copy_windows_file(
+                    &local_installer_path,
+                    &format!(r"{remote_dir}\install.ps1"),
+                )?;
+                self.copy_windows_file(
+                    source_path,
+                    &format!(r"{remote_dir}\herdr-windows-x86_64.zip"),
+                )?;
+
+                let output = self.framed_user_shell_output(&windows_remote_install_command(
+                    &remote_dir,
+                    identity,
+                    sha256,
+                ))?;
+                if !output.status.success() {
+                    return Err(command_failed("remote Windows install failed", &output));
+                }
+                parse_windows_remote_path(
+                    &String::from_utf8_lossy(&output.stdout),
+                    WINDOWS_REMOTE_INSTALL_RESULT_MARKER,
+                )
+                .map(|path| remote_herdr.clone().with_windows_path(path))
+            })();
+
+            let cleanup =
+                self.framed_user_shell_output(&windows_remote_install_cleanup_command(&remote_dir));
+            match install_result {
+                Err(err) => Err(err),
+                Ok(installed) => {
+                    let output = cleanup?;
+                    if output.status.success() {
+                        Ok(installed)
+                    } else {
+                        Err(command_failed("remote install cleanup failed", &output))
+                    }
+                }
+            }
+        })();
+        let _ = fs::remove_dir_all(installer_dir);
+        result
     }
 }
 
@@ -804,29 +1045,70 @@ fn remote_install_commit_script(tmp_path: &str, dest_path: &str) -> String {
     )
 }
 
-impl Drop for RemoteSsh {
-    fn drop(&mut self) {
-        let Some(_options) = self
-            .managed_config
-            .as_ref()
-            .map(|config| &config.options)
-            .filter(|options| options.control_path.is_some())
-        else {
-            return;
-        };
+fn windows_remote_install_prepare_command() -> String {
+    windows_powershell_script_command(&format!(
+        "$remoteInstallDir = Join-Path ([System.IO.Path]::GetTempPath()) ('herdr-remote-' + [System.Guid]::NewGuid().ToString('N')); [System.IO.Directory]::CreateDirectory($remoteInstallDir) | Out-Null; $encodedInstallDir = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteInstallDir)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_INSTALL_DIR_MARKER}' + $encodedInstallDir); exit 0"
+    ))
+}
 
-        let _ = self
-            .base_command()
-            .arg("-O")
-            .arg("exit")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(&self.target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+fn windows_scp_target(target: &str, remote_path: &str) -> String {
+    let remote_path = remote_path.replace('\\', "/");
+    match target.strip_prefix("ssh://") {
+        Some(authority) => {
+            let mut encoded = String::new();
+            for byte in remote_path.bytes() {
+                if byte.is_ascii_alphanumeric() || b"-_.~/:".contains(&byte) {
+                    encoded.push(char::from(byte));
+                } else {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            format!("scp://{authority}/{encoded}")
+        }
+        None => format!("{target}:{remote_path}"),
     }
+}
+
+fn windows_remote_install_command(remote_dir: &str, identity: &str, sha256: &str) -> String {
+    let installer = crate::platform::quote_powershell_arg(&format!(r"{remote_dir}\install.ps1"));
+    let package =
+        crate::platform::quote_powershell_arg(&format!(r"{remote_dir}\herdr-windows-x86_64.zip"));
+    windows_powershell_script_command(&format!(
+        r#"$herdrInstaller = {installer}; $herdrPackage = {package}; & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $herdrInstaller -Channel {channel} -LocalPackagePath $herdrPackage -LocalPackageFormat zip -LocalPackageIdentity {identity} -LocalPackageSha256 {sha256}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Join-Path $herdrHome 'packages\standalone\current'; $activeTarget = [string](Get-Item -LiteralPath $activeJunction -Force -ErrorAction Stop).Target; if ([string]::IsNullOrWhiteSpace($activeTarget)) {{ throw 'Herdr installer did not activate a concrete release.' }}; $installedHerdr = Join-Path $activeTarget 'herdr.exe'; if (-not (Test-Path -LiteralPath $installedHerdr -PathType Leaf)) {{ throw 'Herdr installer result does not contain herdr.exe.' }}; $encodedResult = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([System.IO.Path]::GetFullPath($installedHerdr))); [Console]::Out.WriteLine('{WINDOWS_REMOTE_INSTALL_RESULT_MARKER}' + $encodedResult); exit 0"#,
+        channel = crate::platform::quote_powershell_arg(current_channel()),
+        identity = crate::platform::quote_powershell_arg(identity),
+        sha256 = crate::platform::quote_powershell_arg(sha256),
+    ))
+}
+
+fn windows_remote_install_cleanup_command(remote_dir: &str) -> String {
+    windows_powershell_script_command(&format!(
+        "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction Stop; exit 0",
+        crate::platform::quote_powershell_arg(remote_dir)
+    ))
+}
+
+fn parse_windows_remote_path(stdout: &str, marker: &str) -> io::Result<String> {
+    let encoded = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(marker))
+        .ok_or_else(|| io::Error::other(format!("remote command did not return {marker}")))?;
+    decode_windows_remote_path(encoded)
+}
+
+fn decode_windows_remote_path(encoded: &str) -> io::Result<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| {
+            io::Error::other(format!("remote path result is not valid base64: {err}"))
+        })?;
+    let path = String::from_utf8(bytes)
+        .map_err(|err| io::Error::other(format!("remote path result is not valid UTF-8: {err}")))?;
+    if path.is_empty() {
+        return Err(io::Error::other("remote path result is empty"));
+    }
+    Ok(path)
 }
 
 fn apply_noninteractive_ssh_options(command: &mut Command) {
@@ -848,6 +1130,29 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
 }
 
 fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+    // Compress the first connection too: multiplexed bridges inherit the master's transport.
+    command.arg("-C");
+    let Some(options) = options else {
+        return;
+    };
+
+    command.arg("-F").arg(&options.config_path);
+    if let Some(control_path) = &options.control_path {
+        // User ControlPaths may be shared across isolated Herdr configs (or
+        // explicitly disabled). Managed auth must use our scoped transport;
+        // never stop or unlink a master belonging to the user's SSH setup.
+        command
+            .arg("-S")
+            .arg(control_path)
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=600");
+    }
+}
+
+fn apply_managed_scp_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+    command.arg("-C");
     let Some(options) = options else {
         return;
     };
@@ -855,12 +1160,15 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
     command.arg("-F").arg(&options.config_path);
     if let Some(control_path) = &options.control_path {
         command
-            .arg("-S")
-            .arg(control_path)
+            .arg("-o")
+            .arg(format!(
+                "ControlPath={}",
+                ssh_config_quote(&control_path.to_string_lossy())
+            ))
             .arg("-o")
             .arg("ControlMaster=auto")
             .arg("-o")
-            .arg("ControlPersist=yes");
+            .arg("ControlPersist=600");
     }
 }
 
@@ -894,7 +1202,12 @@ pub(super) fn prepare_remote_herdr(
     let platform = detect_remote_platform(ssh)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     if remote_herdr.platform.is_windows() {
-        return prepare_windows_remote_herdr(ssh, remote_herdr, require_surface_interest);
+        return prepare_windows_remote_herdr(
+            ssh,
+            remote_herdr,
+            live_handoff_enabled,
+            require_surface_interest,
+        );
     }
     let override_binary = remote_binary_override_path()?;
     let remote_binary_candidates = remote_binary_candidates(ssh, &remote_herdr)?;
@@ -964,14 +1277,13 @@ pub(super) fn prepare_remote_herdr(
 pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteHerdr> {
     let platform = detect_remote_platform(ssh)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
-    if remote_herdr.platform.is_windows() {
-        return prepare_windows_remote_herdr(ssh, remote_herdr, true)
-            .map(|prepared| prepared.remote_herdr);
-    }
     let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
-    for candidate in candidates {
-        if remote_binary_supports_endpoint_requirement(ssh, &candidate, true)? {
-            return Ok(candidate);
+    for mut candidate in candidates {
+        if let Some(status) = remote_client_status(ssh, &candidate)? {
+            if status.supports_endpoint_requirement(&candidate.platform, true) {
+                candidate.bridge_idle_timeout = status.remote_bridge_idle_timeout;
+                return Ok(candidate);
+            }
         }
     }
     Err(io::Error::new(
@@ -987,41 +1299,97 @@ pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteH
 fn prepare_windows_remote_herdr(
     ssh: &RemoteSsh,
     remote_herdr: RemoteHerdr,
+    live_handoff_enabled: bool,
     require_surface_interest: bool,
 ) -> io::Result<PreparedRemoteHerdr> {
-    if !remote_binary_exists(ssh, &remote_herdr)? {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "herdr.exe is not installed or is not on PATH on Windows host {}; install a compatible Windows package with remote host support and retry",
-                ssh.target()
-            ),
-        ));
-    }
-    if !remote_binary_supports_endpoint_requirement(ssh, &remote_herdr, require_surface_interest)? {
-        return Err(io::Error::other(format!(
-            "herdr.exe on Windows host {} does not support saved SSH endpoint federation; install a compatible Windows package with remote host support and retry",
-            ssh.target()
-        )));
+    let override_package = remote_binary_override_path()?;
+    let custom_package = override_package.is_some();
+    let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
+    if !custom_package {
+        for candidate in &candidates {
+            if remote_binary_supports_endpoint_requirement(
+                ssh,
+                candidate,
+                require_surface_interest,
+            )? {
+                return Ok(PreparedRemoteHerdr {
+                    remote_herdr: candidate.clone(),
+                    stop_after_install_approved: false,
+                });
+            }
+        }
     }
 
+    let stop_after_install_approved = if let Some(candidate) = candidates.first() {
+        confirm_remote_install_with_running_server(
+            ssh,
+            candidate,
+            live_handoff_enabled,
+            require_surface_interest,
+        )?
+    } else {
+        false
+    };
+    if !stop_after_install_approved {
+        confirm_remote_install(
+            &ssh.destination(),
+            &remote_herdr,
+            &install_source_description(&remote_herdr.platform, override_package.as_deref()),
+        )?;
+    }
+    // Windows needs the complete package, including its app-local ConPTY runtime.
+    let source = match override_package {
+        Some(path) => InstallSource::persistent(path),
+        None => download_release_asset(&remote_herdr.platform)?,
+    };
+    let install_result = (|| {
+        let sha256 = crate::checksum::file_sha256(&source.path)?;
+        ssh.install_windows_herdr(
+            &remote_herdr,
+            &source.path,
+            &windows_package_identity(custom_package, &sha256),
+            &sha256,
+        )
+    })();
+    source.cleanup();
+    let remote_herdr = install_result?;
+    if !remote_binary_supports_endpoint_requirement(ssh, &remote_herdr, require_surface_interest)? {
+        return Err(io::Error::other(format!(
+            "installed remote herdr at {}, but it does not support the required remote hosting capabilities",
+            remote_herdr.executable.display()
+        )));
+    }
     Ok(PreparedRemoteHerdr {
         remote_herdr,
-        stop_after_install_approved: false,
+        stop_after_install_approved,
     })
 }
 
-pub(super) fn find_installed_remote_api_herdr(
+pub(super) fn discover_remote_api_metadata(
     ssh: &RemoteSsh,
     session: &str,
-) -> io::Result<RemoteHerdr> {
+) -> io::Result<crate::client::endpoint::SshMachineMetadata> {
     let platform = detect_remote_platform(ssh)?;
+    if !platform.is_windows() {
+        let output =
+            ssh.framed_user_shell_output(&posix_remote_api_discovery_command(&platform, session))?;
+        if !output.status.success() {
+            return Err(command_failed("remote binary discovery failed", &output));
+        }
+        let metadata = crate::client::endpoint::SshMachineMetadata {
+            os: platform.os.to_owned(),
+            executable: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        };
+        if !metadata.is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid remote Herdr executable path",
+            ));
+        }
+        return Ok(metadata);
+    }
     let remote_herdr = RemoteHerdr::for_platform(platform);
-    let candidates = if remote_herdr.platform.is_windows() {
-        vec![remote_herdr]
-    } else {
-        remote_binary_candidates(ssh, &remote_herdr)?
-    };
+    let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
     for candidate in candidates {
         let probe =
             ssh.framed_user_shell_output(&remote_api_bridge_command(&candidate, session, true))?;
@@ -1031,7 +1399,10 @@ pub(super) fn find_installed_remote_api_herdr(
         if probe.status.success()
             && String::from_utf8_lossy(&probe.stdout).trim() == "herdr-api-bridge-v1"
         {
-            return Ok(candidate);
+            return Ok(crate::client::endpoint::SshMachineMetadata {
+                os: "windows".into(),
+                executable: candidate.executable.display().to_owned(),
+            });
         }
     }
     Err(io::Error::new(
@@ -1120,6 +1491,17 @@ fn remote_binary_candidates(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Vec<RemoteHerdr>> {
+    if remote_herdr.platform.is_windows() {
+        let output = ssh.framed_user_shell_output(&windows_remote_binary_candidate_command())?;
+        if !output.status.success() {
+            return Err(command_failed("remote binary discovery failed", &output));
+        }
+        return Ok(windows_remote_binary_candidates(
+            remote_herdr,
+            &String::from_utf8_lossy(&output.stdout),
+        ));
+    }
+
     let mut candidates = Vec::new();
 
     if let Some(path_candidate) = remote_binary_on_path_any(ssh, remote_herdr)? {
@@ -1138,6 +1520,27 @@ fn remote_binary_candidates(
     }
 
     Ok(candidates)
+}
+
+fn windows_remote_binary_candidate_command() -> String {
+    windows_powershell_script_command(&format!(
+        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
+    ))
+}
+
+fn windows_remote_binary_candidates(remote_herdr: &RemoteHerdr, stdout: &str) -> Vec<RemoteHerdr> {
+    let mut candidates = Vec::new();
+    for path in stdout.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix(WINDOWS_REMOTE_PATH_MARKER)
+            .and_then(|encoded| decode_windows_remote_path(encoded).ok())
+    }) {
+        push_if_new_remote_binary_candidate(
+            &mut candidates,
+            remote_herdr.clone().with_windows_path(path),
+        );
+    }
+    candidates
 }
 
 fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candidate: RemoteHerdr) {
@@ -1246,7 +1649,7 @@ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<Remo
     if is_mise_shim_path(path) {
         return None;
     }
-    Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
+    Some(remote_herdr.clone().with_posix_path(path))
 }
 
 fn is_mise_shim_path(path: &str) -> bool {
@@ -1275,8 +1678,11 @@ fn remote_binary_supports_endpoint_requirement(
     remote_herdr: &RemoteHerdr,
     require_surface_interest: bool,
 ) -> io::Result<bool> {
-    Ok(remote_client_status(ssh, remote_herdr)?
-        .is_some_and(|status| status.supports_endpoint_requirement(require_surface_interest)))
+    Ok(
+        remote_client_status(ssh, remote_herdr)?.is_some_and(|status| {
+            status.supports_endpoint_requirement(&remote_herdr.platform, require_surface_interest)
+        }),
+    )
 }
 
 fn remote_binary_exists(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -1369,13 +1775,21 @@ fn resolve_install_source(
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
-    if *platform != RemotePlatform::local() {
+    if platform.is_windows() || *platform != RemotePlatform::local() {
         return false;
     }
 
     std::env::current_exe()
         .map(|path| !crate::update::is_package_manager_managed_exe_path(&path))
         .unwrap_or(false)
+}
+
+fn windows_package_identity(custom: bool, sha256: &str) -> String {
+    if custom {
+        format!("{}-custom.{sha256}", current_version())
+    } else {
+        current_version()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1621,7 +2035,7 @@ fn probe_remote_endpoint(
         remote_herdr.clone(),
         path.clone(),
         ssh.session_name.clone(),
-        None,
+        ssh.options(),
         true,
     )?;
     let mut stream = crate::ipc::connect_local_stream(&path)?;
@@ -1643,12 +2057,21 @@ struct RemoteClientStatusJson {
     endpoint_protocol_generation: Option<u32>,
     #[serde(default)]
     endpoint_capabilities: Vec<String>,
+    #[serde(default)]
+    remote_host_bridge: bool,
+    #[serde(default)]
+    remote_bridge_idle_timeout: bool,
 }
 
 impl RemoteClientStatusJson {
-    fn supports_endpoint_requirement(&self, require_surface_interest: bool) -> bool {
+    fn supports_endpoint_requirement(
+        &self,
+        platform: &RemotePlatform,
+        require_surface_interest: bool,
+    ) -> bool {
         self.endpoint_protocol_generation
             == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION)
+            && (!platform.is_windows() || self.remote_host_bridge)
             && (!require_surface_interest
                 || [
                     crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY,
@@ -2098,6 +2521,67 @@ fn confirm_remote_install(
     Ok(())
 }
 
+fn posix_remote_api_discovery_command(platform: &RemotePlatform, session: &str) -> String {
+    let script = format!(
+        r#"set -f
+candidates=$(
+command -v herdr
+{discovery}
+)
+IFS='
+'
+for candidate in $candidates; do
+    case "$candidate" in
+        */mise/shims/herdr) continue ;;
+        /*) ;;
+        *) continue ;;
+    esac
+    [ -x "$candidate" ] || continue
+    if capability=$("$candidate" --session {session} remote-api-bridge --check </dev/null 2>/dev/null) && [ "$capability" = herdr-api-bridge-v1 ]; then
+        printf '%s\n' "$candidate"
+        exit 0
+    fi
+done
+printf '%s\n' 'remote Herdr does not support machine API forwarding; update Herdr on this machine' >&2
+exit 2"#,
+        discovery = known_remote_binary_candidate_script(platform),
+        session = shell_quote(session),
+    );
+    format!(
+        "/bin/sh -c {}",
+        shell_quote(&posix_remote_output_command(&script))
+    )
+}
+
+pub(super) const STALE_API_METADATA: &str = "herdr-machine-metadata-stale-v1";
+
+pub(super) fn cached_remote_api_command(
+    metadata: &crate::client::endpoint::SshMachineMetadata,
+    session: &str,
+) -> String {
+    if metadata.os == "windows" {
+        let path = crate::platform::quote_powershell_arg(&metadata.executable);
+        let session_arg = crate::platform::quote_powershell_arg(session);
+        let probe = format!(
+            "$capability = & {path} --session {session_arg} remote-api-bridge --check 2>$null; if ($LASTEXITCODE -ne 0 -or $capability -ne 'herdr-api-bridge-v1') {{ [Console]::Error.WriteLine('{STALE_API_METADATA}'); exit 78 }}; "
+        );
+        return windows_powershell_script_command(&format!(
+            "{probe}{}",
+            windows_powershell_streaming_application_script(
+                &metadata.executable,
+                &["--session", session, "remote-api-bridge"]
+            ),
+        ));
+    }
+    let path = shell_quote(&metadata.executable);
+    let session = shell_quote(session);
+    let script = format!(
+        "if capability=$({path} --session {session} remote-api-bridge --check </dev/null 2>/dev/null) && [ \"$capability\" = herdr-api-bridge-v1 ]; then\n{}\nelse\n    printf '%s\\n' '{STALE_API_METADATA}' >&2\n    exit 78\nfi",
+        posix_remote_output_command(&format!("exec {path} --session {session} remote-api-bridge")),
+    );
+    format!("/bin/sh -c {}", shell_quote(&script))
+}
+
 pub(super) fn remote_api_bridge_command(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -2169,7 +2653,13 @@ impl SshStdioBridge {
     ) -> io::Result<Self> {
         Self::start_command(
             target,
-            remote_herdr.executable.bridge_command(&session_name),
+            if noninteractive && remote_herdr.bridge_idle_timeout {
+                remote_herdr
+                    .executable
+                    .bridge_command_with_idle_timeout(&session_name, true)
+            } else {
+                remote_herdr.executable.bridge_command(&session_name)
+            },
             local_socket,
             ssh_options,
             noninteractive,
@@ -2298,22 +2788,45 @@ fn ssh_config_include_path(path: &Path) -> String {
     }
 }
 
+/// Returns the `Include` value for the user's SSH config, or `None` when there
+/// is nothing useful to include.
+///
+/// Git for Windows' OpenSSH (MSYS) does not resolve Windows drive-letter paths
+/// inside `Include`, so an absolute `C:/.../.ssh/config` path is silently
+/// ignored when herdr runs under Git Bash and host aliases stop resolving.
+/// `~/.ssh/config` is expanded by both Windows OpenSSH (to the user profile)
+/// and MSYS OpenSSH (through `HOME`), so each shell's `ssh` reads the same user
+/// config it would read by default. A missing config is harmless because
+/// OpenSSH ignores an `Include` that matches nothing.
+#[cfg(windows)]
+fn ssh_user_config_include(_path: Option<&Path>) -> Option<String> {
+    Some(ssh_config_quote("~/.ssh/config"))
+}
+
+#[cfg(not(windows))]
+fn ssh_user_config_include(path: Option<&Path>) -> Option<String> {
+    path.filter(|path| path.is_file())
+        .map(ssh_config_include_path)
+}
+
 /// Builds a temporary ssh config that includes the user's settings first, so
 /// OpenSSH's first-value-wins behavior preserves explicit user keepalives.
-fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
+fn write_managed_ssh_config(target: &str) -> io::Result<ManagedSshConfig> {
     let paths = crate::platform::remote_ssh_config_paths();
+    let control_path = if paths.multiplexing {
+        Some(crate::platform::shared_ssh_control_path(
+            &crate::config::config_path(),
+            target,
+        )?)
+    } else {
+        None
+    };
+
     let dir = crate::platform::create_remote_ssh_config_dir(SSH_CONTROL_SOCKET_NAME)?;
     let path = dir.join("config");
-    let control_path = paths
-        .multiplexing
-        .then(|| dir.join(SSH_CONTROL_SOCKET_NAME));
-
     let mut contents = String::new();
-    if let Some(user_config) = paths.user_config.filter(|path| path.is_file()) {
-        contents.push_str(&format!(
-            "Include {}\n",
-            ssh_config_include_path(&user_config)
-        ));
+    if let Some(include) = ssh_user_config_include(paths.user_config.as_deref()) {
+        contents.push_str(&format!("Include {include}\n"));
     }
     if let Some(system_config) = paths.system_config.filter(|path| path.is_file()) {
         contents.push_str(&format!(
@@ -2337,6 +2850,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
         options: ManagedSshOptions {
             config_path: path,
             control_path,
+            _directory: Arc::new(ManagedSshConfigDirectory(dir)),
         },
     })
 }
@@ -2794,6 +3308,20 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn decode_windows_command(command: &str) -> String {
+        let encoded = command
+            .strip_prefix("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ")
+            .expect("encoded PowerShell command");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).expect("UTF-16LE")
+    }
+
     #[cfg(unix)]
     thread_local! {
         pub(super) static UPLOAD_READ_ATTEMPTS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
@@ -3097,7 +3625,7 @@ mod tests {
     fn managed_ssh_config_includes_user_config_then_fallback() {
         use std::os::unix::fs::PermissionsExt;
 
-        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let managed_config = write_managed_ssh_config("example").expect("write managed config");
         let path = managed_config.options.config_path.clone();
         let control_path = managed_config
             .options
@@ -3157,6 +3685,106 @@ mod tests {
         drop(managed_config);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shared_ssh_transport_survives_helper_config_drop() {
+        let first = write_managed_ssh_config("example").unwrap();
+        let second = write_managed_ssh_config("example").unwrap();
+        let socket = first.options.control_path.clone().unwrap();
+        assert_eq!(Some(&socket), second.options.control_path.as_ref());
+        assert_ne!(socket.parent(), first.options.config_path.parent());
+        let config_path = first.options.config_path.clone();
+        drop(first);
+        assert!(!config_path.exists());
+        assert!(socket.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn ssh_authentication_diagnostics_are_narrow() {
+        for message in [
+            "user@host: Permission denied (publickey).",
+            "Permission denied (keyboard-interactive,password).",
+            "Permission denied (password).",
+            "sign_and_send_pubkey: signing failed for ED25519 from agent: agent refused operation",
+        ] {
+            assert!(ssh_error_requires_authentication(message), "{message}");
+        }
+        for message in [
+            "Host key verification failed.",
+            "REMOTE HOST IDENTIFICATION HAS CHANGED!",
+            "Permission denied opening /tmp/file",
+            "Connection refused",
+            "agent disconnected",
+            "Permission denied (publickey). Host key verification failed.",
+        ] {
+            assert!(!ssh_error_requires_authentication(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn bridge_options_keep_temporary_config_alive_after_helper_drop() {
+        let config = write_managed_ssh_config("example").unwrap();
+        let path = config.options.config_path.clone();
+        let worker_options = config.options.clone();
+        drop(config);
+        assert!(path.is_file());
+        drop(worker_options);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentication_command_uses_shared_transport_without_askpass_or_host_key_relaxation() {
+        let config = write_managed_ssh_config("example").unwrap();
+        let setup = RemoteSsh::new("example".into(), true, "other-session".into());
+        assert_eq!(
+            config.options.control_path,
+            setup.options().unwrap().control_path
+        );
+        let authentication = authentication_command_with_config("example", config);
+        let command = &authentication.command;
+        assert_eq!(command.get_program(), "ssh");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        for required in [
+            "ControlMaster=auto",
+            "ControlPersist=600",
+            "BatchMode=no",
+            "StrictHostKeyChecking=yes",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "missing {required}");
+        }
+        assert_eq!(&args[args.len() - 3..], &["-T", "example", "exit"]);
+        let env = command.get_envs().collect::<Vec<_>>();
+        assert!(env.iter().any(
+            |(key, value)| *key == std::ffi::OsStr::new("SSH_ASKPASS_REQUIRE")
+                && *value == Some(std::ffi::OsStr::new("never"))
+        ));
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == std::ffi::OsStr::new("SSH_ASKPASS") && value.is_none()));
+    }
+
+    #[test]
+    fn authentication_command_rejects_option_injection() {
+        assert_eq!(
+            ssh_authentication_command("-oProxyCommand=bad")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn unmanaged_ssh_setup_preserves_plain_transport() {
+        let ssh = RemoteSsh::new("example".into(), false, "main".into());
+        assert!(ssh.options().is_none());
+        assert!(!ssh.command().get_args().any(|arg| arg == "-F"));
+    }
+
     #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
@@ -3168,13 +3796,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_ssh_command_uses_managed_config_when_present() {
-        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let managed_config = write_managed_ssh_config("example").expect("write managed config");
         let config_path = managed_config.options.config_path.clone();
-        let control_path = managed_config
-            .options
-            .control_path
-            .clone()
-            .expect("Unix managed config has a control path");
+        let control_path = managed_config.options.control_path.clone().unwrap();
         let ssh = RemoteSsh {
             target: "example".to_string(),
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
@@ -3191,6 +3815,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-C".to_string(),
                 "-F".to_string(),
                 config_path.to_string_lossy().into_owned(),
                 "-S".to_string(),
@@ -3198,9 +3823,29 @@ mod tests {
                 "-o".to_string(),
                 "ControlMaster=auto".to_string(),
                 "-o".to_string(),
-                "ControlPersist=yes".to_string(),
+                "ControlPersist=600".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
+            ]
+        );
+
+        let scp_args = ssh
+            .scp_command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scp_args,
+            vec![
+                "-C".to_string(),
+                "-F".to_string(),
+                config_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                format!("ControlPath=\"{}\"", control_path.to_string_lossy()),
+                "-o".to_string(),
+                "ControlMaster=auto".to_string(),
+                "-o".to_string(),
+                "ControlPersist=600".to_string(),
             ]
         );
     }
@@ -3208,12 +3853,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_managed_ssh_config_uses_keepalives_without_control_socket() {
-        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let managed_config = write_managed_ssh_config("example").expect("write managed config");
         let config_path = managed_config.options.config_path.clone();
         assert!(managed_config.options.control_path.is_none());
         let contents = std::fs::read_to_string(&config_path).expect("read managed config");
         assert!(contents.contains("ServerAliveInterval 15"));
         assert!(contents.contains("ServerAliveCountMax 4"));
+        // Git Bash's MSYS OpenSSH ignores drive-letter `Include` paths, so the
+        // user config must be referenced through `~` for aliases to resolve.
+        let include_at = contents
+            .find("Include \"~/.ssh/config\"")
+            .expect("user config Included through home");
+        let fallback_at = contents.find("Host *").expect("fallback present");
+        assert!(
+            include_at < fallback_at,
+            "user config must be Included before herdr's fallback: {contents}"
+        );
 
         let ssh = RemoteSsh {
             target: "example".to_string(),
@@ -3229,10 +3884,24 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-C".to_string(),
                 "-F".to_string(),
                 config_path.to_string_lossy().into_owned(),
                 "-T".to_string(),
                 "example".to_string(),
+            ]
+        );
+        let scp_args = ssh
+            .scp_command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scp_args,
+            vec![
+                "-C".to_string(),
+                "-F".to_string(),
+                config_path.to_string_lossy().into_owned(),
             ]
         );
     }
@@ -3243,6 +3912,59 @@ mod tests {
         assert_eq!(
             ssh_config_include_path(Path::new(r"C:\Users\A B\.ssh\config")),
             r#""C:/Users/A B/.ssh/config""#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ssh_user_config_include_uses_home_shorthand() {
+        // MSYS/Git Bash OpenSSH does not resolve `C:/...` in `Include`, so the
+        // user config is referenced through `~` regardless of the profile path.
+        assert_eq!(
+            ssh_user_config_include(Some(Path::new(r"C:\Users\A B\.ssh\config"))),
+            Some(r#""~/.ssh/config""#.to_string())
+        );
+        assert_eq!(
+            ssh_user_config_include(None),
+            Some(r#""~/.ssh/config""#.to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_probe_preserves_setup_ssh_options() {
+        let managed_config = write_managed_ssh_config("example").expect("write managed config");
+        let marker = managed_config
+            .options
+            .config_path
+            .with_file_name("probe-ran");
+        fs::write(
+            &managed_config.options.config_path,
+            format!(
+                "Host *\n  ProxyCommand /bin/sh -c {}\n",
+                shell_quote(&format!(
+                    ": > {}; exit 1",
+                    shell_quote(&marker.to_string_lossy())
+                ))
+            ),
+        )
+        .expect("write isolated probe config");
+        let ssh = RemoteSsh {
+            target: "herdr-probe.invalid".into(),
+            session_name: "probe-options".into(),
+            managed_config: Some(managed_config),
+            noninteractive: false,
+        };
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+
+        let error = probe_remote_endpoint(&ssh, &remote).expect_err("proxy refuses connection");
+
+        assert!(
+            marker.exists(),
+            "endpoint probe discarded the authenticated setup's SSH options: {error}"
         );
     }
 
@@ -3262,6 +3984,7 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         for required in [
+            "-C",
             "BatchMode=yes",
             "NumberOfPasswordPrompts=0",
             "StrictHostKeyChecking=yes",
@@ -3272,8 +3995,7 @@ mod tests {
         ] {
             assert!(args.iter().any(|arg| arg == required), "missing {required}");
         }
-        assert!(!args.iter().any(|arg| arg == "-F"));
-        assert!(ssh.options().is_none());
+        assert_eq!(args.iter().any(|arg| arg == "-F"), ssh.options().is_some());
     }
 
     #[test]
@@ -3298,6 +4020,10 @@ mod tests {
 
     #[test]
     fn saved_machine_compatibility_uses_capabilities_not_release_or_private_protocol() {
+        let linux = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
         let mut status = RemoteClientStatusJson {
             version: Some("0.1.0".into()),
             protocol: Some(1),
@@ -3309,16 +4035,18 @@ mod tests {
                 crate::protocol::endpoint::PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
                 crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY.into(),
             ],
+            remote_host_bridge: false,
+            remote_bridge_idle_timeout: false,
         };
-        assert!(status.supports_endpoint_requirement(true));
+        assert!(status.supports_endpoint_requirement(&linux, true));
         for index in 0..status.endpoint_capabilities.len() {
             let removed = status.endpoint_capabilities.remove(index);
-            assert!(!status.supports_endpoint_requirement(true));
-            assert!(status.supports_endpoint_requirement(false));
+            assert!(!status.supports_endpoint_requirement(&linux, true));
+            assert!(status.supports_endpoint_requirement(&linux, false));
             status.endpoint_capabilities.insert(index, removed);
         }
         status.endpoint_protocol_generation = None;
-        assert!(!status.supports_endpoint_requirement(true));
+        assert!(!status.supports_endpoint_requirement(&linux, true));
     }
 
     #[test]
@@ -3351,7 +4079,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_ssh_command_is_plain_without_managed_config() {
+    fn remote_ssh_commands_compress_without_managed_config() {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
@@ -3365,7 +4093,8 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(args, vec!["-T".to_string(), "example".to_string()]);
+        assert_eq!(args, vec!["-C", "-T", "example"]);
+        assert_eq!(ssh.scp_command().get_args().collect::<Vec<_>>(), vec!["-C"]);
     }
 
     #[test]
@@ -3686,21 +4415,64 @@ mod tests {
     }
 
     #[test]
-    fn windows_remote_commands_use_one_encoded_powershell_grammar() {
-        fn decode(command: &str) -> String {
-            let encoded = command
-                .strip_prefix("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ")
-                .expect("encoded PowerShell command");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .expect("base64");
-            let utf16 = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect::<Vec<_>>();
-            String::from_utf16(&utf16).expect("UTF-16LE")
-        }
+    fn machine_metadata_keeps_raw_resolved_paths_not_shell_expressions() {
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert!(remote.machine_metadata().is_none());
+        let path = "/home/user's files/$literal/herdr";
+        let resolved = remote.with_posix_path(path);
+        assert_eq!(resolved.machine_metadata().unwrap().executable, path);
+        assert_eq!(resolved.executable.display(), shell_quote(path));
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        });
+        assert!(remote.machine_metadata().is_none());
+        let path = r"C:\Users\A B\herdr.exe";
+        assert_eq!(
+            remote
+                .with_windows_path(path.into())
+                .machine_metadata()
+                .unwrap()
+                .executable,
+            path
+        );
+    }
 
+    #[test]
+    fn cached_windows_api_command_checks_before_starting_the_stream() {
+        let path = r"C:\Users\A'B\herdr.exe";
+        let command = cached_remote_api_command(
+            &crate::client::endpoint::SshMachineMetadata {
+                os: "windows".into(),
+                executable: path.into(),
+            },
+            "fleet",
+        );
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let words = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let script = String::from_utf16(&words).unwrap();
+        assert!(script.contains(&crate::platform::quote_powershell_arg(path)));
+        assert!(script.contains(STALE_API_METADATA));
+        assert!(
+            script.find("remote-api-bridge --check").unwrap()
+                < script.find("Start-Process").unwrap()
+        );
+        assert!(script.contains("$LASTEXITCODE -ne 0"));
+        assert!(script.contains("-NoNewWindow -PassThru"));
+        assert!(script.contains("--session fleet remote-api-bridge"));
+    }
+
+    #[test]
+    fn windows_remote_commands_use_one_encoded_powershell_grammar() {
         let executable = RemoteExecutable::WindowsPath("herdr.exe".to_string());
         let commands = [
             (
@@ -3754,12 +4526,92 @@ mod tests {
             "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); "
         );
         for (label, command, expected) in commands {
-            let script = decode(&command);
+            let script = decode_windows_command(&command);
             let script = script
                 .strip_prefix(&preamble)
                 .unwrap_or_else(|| panic!("{label} lacks shared output marker: {script}"));
             assert_eq!(script, expected, "{label}");
         }
+    }
+
+    #[test]
+    fn windows_install_commands_copy_zip_and_return_concrete_path() {
+        assert_eq!(
+            windows_scp_target("ssh://user@example:2222", r"C:\Temp\A+B%20 C\ü\install.ps1"),
+            "scp://user@example:2222/C:/Temp/A%2BB%2520%20C/%C3%BC/install.ps1"
+        );
+        assert_eq!(
+            windows_scp_target("example", r"C:\Temp\A+B%20 C\install.ps1"),
+            "example:C:/Temp/A+B%20 C/install.ps1"
+        );
+        let remote_dir = r"C:\Temp\Herdr O'Brien\测试";
+        assert_eq!(
+            windows_scp_target(
+                "user@example",
+                &format!(r"{remote_dir}\herdr-windows-x86_64.zip")
+            ),
+            "user@example:C:/Temp/Herdr O'Brien/测试/herdr-windows-x86_64.zip"
+        );
+        assert_eq!(
+            windows_scp_target("ssh://user@example:2222", r"C:\Temp\install.ps1"),
+            "scp://user@example:2222/C:/Temp/install.ps1"
+        );
+
+        let command = decode_windows_command(&windows_remote_install_command(
+            remote_dir,
+            "0.9.0-custom.digest",
+            &"a".repeat(64),
+        ));
+        assert!(command.contains("-LocalPackageFormat zip"));
+        assert!(command.contains("-LocalPackageIdentity 0.9.0-custom.digest"));
+        assert!(command.contains(".Target"));
+        assert!(command.contains(WINDOWS_REMOTE_INSTALL_RESULT_MARKER));
+
+        let installed = r"C:\Users\test\测试\.herdr\packages\standalone\releases\0.9.0\herdr.exe";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(installed);
+        assert_eq!(
+            parse_windows_remote_path(
+                &format!("installer chatter\n{WINDOWS_REMOTE_INSTALL_RESULT_MARKER}{encoded}\n"),
+                WINDOWS_REMOTE_INSTALL_RESULT_MARKER
+            )
+            .unwrap(),
+            installed
+        );
+        assert!(parse_windows_remote_path(
+            "installer chatter",
+            WINDOWS_REMOTE_INSTALL_RESULT_MARKER
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn windows_candidate_discovery_prefers_path_then_active_release() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        });
+        let path = r"C:\stale\herdr.exe";
+        let active = r"C:\Users\test\.herdr\packages\standalone\releases\current\herdr.exe";
+        let stdout = format!(
+            "{WINDOWS_REMOTE_PATH_MARKER}{}\nnoise\n{WINDOWS_REMOTE_PATH_MARKER}{}\n{WINDOWS_REMOTE_PATH_MARKER}{}\n",
+            base64::engine::general_purpose::STANDARD.encode(path),
+            base64::engine::general_purpose::STANDARD.encode(active),
+            base64::engine::general_purpose::STANDARD.encode(active),
+        );
+        let candidates = windows_remote_binary_candidates(&remote_herdr, &stdout);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].executable,
+            RemoteExecutable::WindowsPath(path.to_string())
+        );
+        assert_eq!(
+            candidates[1].executable,
+            RemoteExecutable::WindowsPath(active.to_string())
+        );
+
+        let command = decode_windows_command(&windows_remote_binary_candidate_command());
+        assert!(command.contains("Get-Command herdr.exe"));
+        assert!(command.contains("$activeJunction.Target"));
     }
 
     #[test]
@@ -3871,6 +4723,25 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn remote_bridge_idle_timeout_requires_explicit_support_and_opt_in() {
+        let legacy = parse_client_status_json(r#"{"endpoint_protocol_generation":1}"#).unwrap();
+        assert!(!legacy.remote_bridge_idle_timeout);
+        let current = parse_client_status_json(
+            r#"{"endpoint_protocol_generation":1,"remote_bridge_idle_timeout":true}"#,
+        )
+        .unwrap();
+        assert!(current.remote_bridge_idle_timeout);
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert!(remote
+            .executable
+            .bridge_command_with_idle_timeout("agents", true)
+            .ends_with(" --session agents remote-client-bridge --idle-timeout-v1"));
     }
 
     #[test]
@@ -4097,6 +4968,10 @@ mod tests {
 
     #[test]
     fn saved_machine_setup_handoffs_old_server_missing_presentation_fence() {
+        let linux = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
         // Captured from Rohan after installing a new binary while the old daemon stayed alive.
         let installed = parse_client_status_json(
             r#"{"version":"0.8.2","protocol":22,"endpoint_protocol_generation":1,"endpoint_capabilities":["surface_interest","presentation_effects_fence","health_check"]}"#,
@@ -4106,8 +4981,8 @@ mod tests {
             r#"{"version":"0.8.2","protocol":22,"endpoint_protocol_generation":1,"endpoint_capabilities":["surface_interest","health_check"]}"#,
         )
         .unwrap();
-        assert!(installed.supports_endpoint_requirement(true));
-        assert!(!running_binary.supports_endpoint_requirement(true));
+        assert!(installed.supports_endpoint_requirement(&linux, true));
+        assert!(!running_binary.supports_endpoint_requirement(&linux, true));
         for (live_capabilities, expected) in [
             (
                 running_binary.endpoint_capabilities,
@@ -4151,6 +5026,38 @@ mod tests {
                 "setup must follow the running server's negotiated capabilities",
             );
         }
+    }
+
+    #[test]
+    fn windows_reuse_requires_explicit_remote_host_bridge() {
+        let windows = RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        };
+        let linux = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let old =
+            parse_client_status_json(r#"{"version":"0.8.2","endpoint_protocol_generation":1}"#)
+                .unwrap();
+        let current = parse_client_status_json(
+            r#"{"version":"0.9.0","endpoint_protocol_generation":1,"remote_host_bridge":true}"#,
+        )
+        .unwrap();
+
+        assert!(!old.supports_endpoint_requirement(&windows, false));
+        assert!(current.supports_endpoint_requirement(&windows, false));
+        assert!(old.supports_endpoint_requirement(&linux, false));
+        assert!(!local_binary_can_seed_remote(&windows));
+        assert_eq!(
+            windows_package_identity(true, &"a".repeat(64)),
+            format!("{}-custom.{}", current_version(), "a".repeat(64))
+        );
+        assert_eq!(
+            windows_package_identity(false, "ignored"),
+            current_version()
+        );
     }
 
     #[test]

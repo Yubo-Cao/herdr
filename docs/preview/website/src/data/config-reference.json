@@ -410,7 +410,7 @@
           "key": "terminal.default_shell",
           "type": "string",
           "default": "\"\"",
-          "description": "Executable used for new interactive panes. Empty means SHELL, then /bin/sh."
+          "description": "Executable used for new interactive panes. Empty means SHELL, then /bin/sh; on Windows, pwsh.exe when present on PATH, otherwise powershell.exe."
         },
         {
           "key": "terminal.shell_mode",
@@ -696,6 +696,12 @@
           "type": "keybinding",
           "default": "\"prefix+e\"",
           "description": "Open the focused pane scrollback in $EDITOR."
+        },
+        {
+          "key": "keys.clear_pane",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Clear the focused pane screen and scrollback, keeping the current cursor line and its visible soft-wrapped rows. Sends no input to the running program and does nothing on the alternate screen (for example, Vim). Unset by default; for example, clear_pane = \"prefix+ctrl+k\"."
         },
         {
           "key": "keys.copy_mode",
@@ -1380,6 +1386,17 @@
           ]
         },
         {
+          "key": "ui.sound.agents.letta",
+          "type": "enum",
+          "default": "\"default\"",
+          "description": "Sound override for detected Letta Code agents.",
+          "values": [
+            "default",
+            "on",
+            "off"
+          ]
+        },
+        {
           "key": "ui.sound.agents.maki",
           "type": "enum",
           "default": "\"default\"",
@@ -1483,7 +1500,7 @@
           "key": "experimental.cjk_ime_agents",
           "type": "list of strings",
           "default": "[]",
-          "description": "Restrict `reveal_hidden_cursor_for_cjk_ime` to focused panes whose detected agent matches one of these names (case-insensitive). Empty list means apply to any focused pane. Unknown agent names are ignored; if the list contains no valid names, the reveal does not apply. Accepted names: pi, claude, codex, gemini, cursor, devin, cline, opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder, qwen, qwen-code, maki."
+          "description": "Restrict `reveal_hidden_cursor_for_cjk_ime` to focused panes whose detected agent matches one of these names (case-insensitive). Empty list means apply to any focused pane. Unknown agent names are ignored; if the list contains no valid names, the reveal does not apply. Accepted names: pi, claude, codex, gemini, cursor, devin, cline, opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder, qwen, qwen-code, letta, letta-code, maki."
         },
         {
           "key": "experimental.cjk_ime_cursor_shape",

@@ -6,14 +6,21 @@ use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use jsonc_parser::ParseOptions;
 use serde_json::Value;
 
+use super::config_file::{check_config_target, write_config};
+
 const TUI_CONFIG_NAME: &str = "tui.jsonc";
 
-pub(crate) fn tui_config_path(config_dir: &Path) -> PathBuf {
-    config_dir.join(TUI_CONFIG_NAME)
+fn tui_config_paths(config_dir: &Path) -> [PathBuf; 2] {
+    [
+        config_dir.join(TUI_CONFIG_NAME),
+        config_dir.join("tui.json"),
+    ]
 }
 
 pub(crate) fn validate_tui_plugin_config(config_dir: &Path) -> io::Result<()> {
-    validate_plugin_config(&tui_config_path(config_dir), "plugin")?;
+    for path in tui_config_paths(config_dir) {
+        validate_plugin_config(&path, "plugin")?;
+    }
     validate_plugin_config(&config_dir.join("cli.json"), "plugins")
 }
 
@@ -35,7 +42,13 @@ fn validate_plugin_config(config_path: &Path, key: &str) -> io::Result<()> {
 }
 
 pub(crate) fn add_tui_plugin(config_dir: &Path, plugin_spec: &str) -> io::Result<PathBuf> {
-    add_plugin(tui_config_path(config_dir), "plugin", plugin_spec)
+    for path in tui_config_paths(config_dir) {
+        if plugin_is_configured(&path, "plugin", plugin_spec) {
+            return Ok(path);
+        }
+    }
+    // Keep tui.json absent on fresh installs so OpenCode can migrate its settings.
+    add_plugin(config_dir.join(TUI_CONFIG_NAME), "plugin", plugin_spec)
 }
 
 pub(crate) fn add_cli_plugin(
@@ -44,6 +57,7 @@ pub(crate) fn add_cli_plugin(
     plugin_spec: &str,
 ) -> io::Result<Option<PathBuf>> {
     let path = config_dir.join("cli.json");
+    check_config_target(&path)?;
     // OpenCode imports V1 TUI preferences (`tui.json`, `kv.json`) into cli.json on
     // its first V2 start, but only while cli.json is absent. Defer registration
     // while those sources still exist so we do not skip the migration; otherwise
@@ -60,6 +74,7 @@ fn cli_migration_pending(config_dir: &Path, state_dir: &Path) -> bool {
 }
 
 fn add_plugin(config_path: PathBuf, key: &str, plugin_spec: &str) -> io::Result<PathBuf> {
+    check_config_target(&config_path)?;
     let content = if config_path.is_file() {
         fs::read_to_string(&config_path)?
     } else {
@@ -90,12 +105,25 @@ fn add_plugin(config_path: PathBuf, key: &str, plugin_spec: &str) -> io::Result<
         }
     }
 
-    fs::write(&config_path, root.to_string())?;
+    write_config(&config_path, root.to_string())?;
     Ok(config_path)
 }
 
-pub(crate) fn remove_tui_plugin(config_dir: &Path, plugin_spec: &str) -> io::Result<bool> {
-    remove_plugin(&tui_config_path(config_dir), "plugin", plugin_spec)
+pub(crate) fn remove_tui_plugin(config_dir: &Path, plugin_spec: &str) -> io::Result<Vec<PathBuf>> {
+    let mut updated = Vec::new();
+    let mut errors = Vec::new();
+    for path in tui_config_paths(config_dir) {
+        match remove_plugin(&path, "plugin", plugin_spec) {
+            Ok(true) => updated.push(path),
+            Ok(false) => {}
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+    if errors.is_empty() {
+        Ok(updated)
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
 }
 
 pub(crate) fn remove_cli_plugin(config_dir: &Path, plugin_spec: &str) -> io::Result<bool> {
@@ -103,6 +131,7 @@ pub(crate) fn remove_cli_plugin(config_dir: &Path, plugin_spec: &str) -> io::Res
 }
 
 fn remove_plugin(config_path: &Path, key: &str, plugin_spec: &str) -> io::Result<bool> {
+    check_config_target(config_path)?;
     if !config_path.is_file() {
         return Ok(false);
     }
@@ -133,12 +162,14 @@ fn remove_plugin(config_path: &Path, key: &str, plugin_spec: &str) -> io::Result
         property.remove();
     }
 
-    fs::write(config_path, root.to_string())?;
+    write_config(config_path, root.to_string())?;
     Ok(true)
 }
 
 pub(crate) fn tui_plugin_is_configured(config_dir: &Path, plugin_spec: &str) -> bool {
-    plugin_is_configured(&tui_config_path(config_dir), "plugin", plugin_spec)
+    tui_config_paths(config_dir)
+        .iter()
+        .any(|path| plugin_is_configured(path, "plugin", plugin_spec))
 }
 
 pub(crate) fn cli_plugin_is_configured(config_dir: &Path, plugin_spec: &str) -> bool {
@@ -245,6 +276,48 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_cli_registration_preserves_existing_config() {
+        const CHILD_CONFIG: &str = "HERDR_TEST_3970_CONFIG_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_CONFIG) {
+            let dir = PathBuf::from(dir);
+            let result = add_cli_plugin(&dir, &dir.join("state"), "./herdr-opencode");
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EFBIG));
+            println!("registration reached the file-size limit");
+            return;
+        }
+
+        let dir = unique_dir();
+        let path = dir.join("cli.json");
+        let original = r#"{"theme":{"name":"catppuccin"},"plugins":["example"]}"#;
+        fs::write(&path, original).unwrap();
+        // Apply the limit only to a child, after seeding the existing preferences.
+        // Ignoring SIGXFSZ makes the kernel return EFBIG instead of killing it.
+        let output = std::process::Command::new("bash")
+            .args(["-c", "trap '' XFSZ; ulimit -f 0; exec \"$@\"", "herdr-test"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "integration::opencode_config::tests::failed_cli_registration_preserves_existing_config",
+                "--nocapture",
+            ])
+            .env(CHILD_CONFIG, &dir)
+            .output()
+            .unwrap();
+        let actual = fs::read_to_string(&path).unwrap();
+        let remaining_files = fs::read_dir(&dir).unwrap().count();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("registration reached the file-size limit"));
+        assert_eq!(
+            actual, original,
+            "failed registration must preserve preferences"
+        );
+        assert_eq!(remaining_files, 1, "temporary files must be cleaned up");
+    }
+
     #[test]
     fn add_and_remove_tui_plugin_preserves_jsonc_config() {
         let dir = unique_dir();
@@ -276,7 +349,10 @@ mod tests {
             ])
         );
 
-        assert!(remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap());
+        assert_eq!(
+            remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap(),
+            vec![config_path.clone()]
+        );
         let removed_content = fs::read_to_string(&config_path).unwrap();
         assert!(removed_content.contains("// Keep this comment."));
         let removed = parse_config(&config_path);
@@ -317,11 +393,31 @@ mod tests {
         let dir = unique_dir();
         let config_path = add_tui_plugin(&dir, "./herdr-tui-state.js").unwrap();
 
-        assert!(remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap());
+        assert_eq!(
+            remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap(),
+            vec![config_path.clone()]
+        );
         assert!(config_path.is_file());
         assert_eq!(parse_config(&config_path), json!({}));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_tui_plugin_accepts_json_registration() {
+        let dir = unique_dir();
+        fs::write(
+            dir.join("tui.json"),
+            r#"{"plugin":["./herdr-tui-session.js"]}"#,
+        )
+        .unwrap();
+
+        let configured = tui_plugin_is_configured(&dir, "./herdr-tui-session.js");
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            configured,
+            "OpenCode loads plugin registrations from tui.json"
+        );
     }
 
     #[test]
@@ -334,7 +430,10 @@ mod tests {
         .unwrap();
 
         assert!(tui_plugin_is_configured(&dir, "./herdr-tui-state.js"));
-        assert!(remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap());
+        assert_eq!(
+            remove_tui_plugin(&dir, "./herdr-tui-state.js").unwrap(),
+            vec![dir.join(TUI_CONFIG_NAME)]
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

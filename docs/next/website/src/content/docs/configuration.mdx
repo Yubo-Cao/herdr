@@ -73,7 +73,7 @@ Set the executable Herdr uses for newly created interactive panes:
 default_shell = "nu"
 ```
 
-When unset or empty, Herdr uses `$SHELL`, then `/bin/sh` on Unix and PowerShell on Windows. This is an executable name or path, not a shell command line. Existing panes keep their current shell until they are recreated. Custom command keybinding strings run through `/bin/sh -c` for pane commands and `/bin/sh -lc` for detached commands on Unix; on Windows they run through `cmd.exe /d /c`.
+When unset or empty, Herdr uses `$SHELL`, then `/bin/sh` on Unix. On Windows it uses `pwsh.exe` (PowerShell 7) when it resolves on `PATH`, and otherwise the inbox `powershell.exe` (Windows PowerShell 5.1). This is an executable name or path, not a shell command line. Existing panes keep their current shell until they are recreated. Custom command keybinding strings run through `/bin/sh -c` for pane commands and `/bin/sh -lc` for detached commands on Unix; on Windows they run through `cmd.exe /d /c`.
 
 Set how Herdr starts newly created interactive pane shells:
 
@@ -512,7 +512,9 @@ Search the [Config reference](/docs/config-reference/) for scrollback limits, ne
 
 ## Kitty graphics
 
-Herdr renders pane images by default in compatible outer terminals. To disable graphics rendering and the pane graphics API:
+Herdr renders pane images by default in compatible outer terminals. Popups, menus, and notifications temporarily hide only the image placements they overlap. Uncovered images stay visible, and hidden placements return when uncovered. Images do not dim with dialog backgrounds.
+
+To disable graphics rendering and the pane graphics API:
 
 ```toml
 [terminal]
@@ -530,7 +532,10 @@ Herdr resumes supported Agent conversations after a server restart by default:
 ```toml
 [session]
 resume_agents_on_restore = true
+startup_per_agent_delay_ms = 100
 ```
+
+Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 

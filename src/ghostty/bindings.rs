@@ -1776,6 +1776,15 @@ unsafe extern "C" {
     ) -> GhosttyResult;
 }
 unsafe extern "C" {
+    #[doc = " Derive a word selection with a shared forward/backward cell inspection limit.\n\n Like ghostty_terminal_select_word(), but returns GHOSTTY_NO_VALUE if\n max_cells is zero or the search exhausts that budget. No partial selection\n is returned. The existing options structure and unbounded API are unchanged.\n\n @ingroup selection"]
+    pub fn ghostty_terminal_select_word_bounded(
+        terminal: GhosttyTerminal,
+        options: *const GhosttyTerminalSelectWordOptions,
+        max_cells: usize,
+        out_selection: *mut GhosttySelection,
+    ) -> GhosttyResult;
+}
+unsafe extern "C" {
     #[doc = " Derive the nearest word selection snapshot between two terminal grid refs.\n\n Starting at options->start, this searches toward options->end (inclusive)\n and returns the first selectable word found using Ghostty's word-selection\n rules.\n\n This is useful for implementing double-click-and-drag selection in a UI. If\n a user double-clicks one word and drags across spaces or punctuation toward\n another word, selecting only the word directly under the current pointer can\n flicker or collapse when the pointer is between words. Instead, ask for the\n nearest word between the original click and the drag point, ask again in the\n reverse direction, and combine the two word bounds into the drag selection.\n\n @snippet c-vt-selection/src/main.c selection-word-between\n\n The returned selection is not installed as the terminal's current\n selection. It is a snapshot with the same lifetime rules as GhosttySelection.\n\n @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)\n @param options Word-between-selection options\n @param[out] out_selection On success, receives the derived selection\n @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if there is no\n         selectable word content between the valid refs, or\n         GHOSTTY_INVALID_VALUE if the terminal, options, refs, codepoint\n         pointer, or output pointer are invalid.\n\n @ingroup selection"]
     pub fn ghostty_terminal_select_word_between(
         terminal: GhosttyTerminal,
@@ -3226,6 +3235,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Perform a full reset of the terminal (RIS).\n\n Resets all terminal state back to its initial configuration, including\n modes, scrollback, scrolling region, and screen contents. The terminal\n dimensions are preserved.\n\n @param terminal The terminal handle (may be NULL, in which case this is a no-op)\n\n @ingroup terminal"]
     pub fn ghostty_terminal_reset(terminal: GhosttyTerminal);
+}
+unsafe extern "C" {
+    #[doc = " Clear screen and history, retaining the cursor's soft-wrapped active line.\n Does not alter the VT parser or write to the child process. Returns false\n without changing the terminal on the alternate screen or for a NULL handle.\n Otherwise returns true and moves the retained line to the top of the screen."]
+    pub fn ghostty_terminal_clear_screen(terminal: GhosttyTerminal) -> bool;
 }
 unsafe extern "C" {
     #[doc = " Resize the terminal to the given dimensions.\n\n Changes the number of columns and rows in the terminal. The primary\n screen will reflow content if wraparound mode is enabled; the alternate\n screen does not reflow. If the dimensions are unchanged, this is a no-op.\n\n This also updates the terminal's pixel dimensions (used for image\n protocols and size reports), disables synchronized output mode (allowed\n by the spec so that resize results are shown immediately), and sends an\n in-band size report if mode 2048 is enabled.\n\n @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)\n @param cols New width in cells (must be greater than zero)\n @param rows New height in cells (must be greater than zero)\n @param cell_width_px Width of a single cell in pixels\n @param cell_height_px Height of a single cell in pixels\n @return GHOSTTY_SUCCESS on success, or an error code on failure\n\n @ingroup terminal"]

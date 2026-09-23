@@ -269,6 +269,8 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Milliseconds between automatic agent restores. Zero disables spacing.
+    pub startup_per_agent_delay_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -303,6 +305,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            startup_per_agent_delay_ms: 100,
         }
     }
 }
@@ -435,6 +438,7 @@ pub struct KeysConfig {
     pub rename_pane: BindingConfig,
     /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
     pub edit_scrollback: BindingConfig,
+    pub clear_pane: BindingConfig,
     /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
     pub copy_mode: BindingConfig,
     /// Focus the pane to the left. Default: "prefix+h".
@@ -566,6 +570,7 @@ pub(crate) struct KeysConfigOverlay {
     rename_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edit_scrollback: Option<BindingConfig>,
+    clear_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copy_mode: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -676,6 +681,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(close_tab);
         apply_field!(rename_pane);
         apply_field!(edit_scrollback);
+        apply_field!(clear_pane);
         apply_field!(copy_mode);
         apply_field!(focus_pane_left);
         apply_field!(focus_pane_down);
@@ -780,6 +786,7 @@ impl KeysConfig {
         copy_effective_action_field!(close_tab, keybinds.close_tab);
         copy_effective_action_field!(rename_pane, keybinds.rename_pane);
         copy_effective_action_field!(edit_scrollback, keybinds.edit_scrollback);
+        copy_effective_action_field!(clear_pane, keybinds.clear_pane);
         copy_effective_action_field!(copy_mode, keybinds.copy_mode);
         copy_effective_action_field!(focus_pane_left, keybinds.focus_pane_left);
         copy_effective_action_field!(focus_pane_down, keybinds.focus_pane_down);
@@ -1090,7 +1097,7 @@ pub struct ExperimentalConfig {
     /// if the list contains no valid names, the reveal does not apply.
     /// Accepted names: pi, claude, codex, gemini, cursor, devin, cline,
     /// opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo,
-    /// qodercli, qoder, qwen, qwen-code, maki.
+    /// qodercli, qoder, qwen, qwen-code, letta, letta-code, maki.
     /// Default: empty.
     pub cjk_ime_agents: Vec<String>,
     /// Cursor shape rendered for the IME anchor when
@@ -1148,6 +1155,7 @@ impl Default for KeysConfig {
             close_tab: BindingConfig::one("prefix+shift+x"),
             rename_pane: BindingConfig::one("prefix+shift+p"),
             edit_scrollback: BindingConfig::one("prefix+e"),
+            clear_pane: BindingConfig::default(),
             copy_mode: BindingConfig::one("prefix+["),
             focus_pane_left: BindingConfig::one("prefix+h"),
             focus_pane_down: BindingConfig::one("prefix+j"),
@@ -1449,13 +1457,16 @@ new_cwd = "~/Projects"
     fn resume_agents_on_restore_defaults_on_and_parses() {
         let default_config = Config::default();
         assert!(default_config.session.resume_agents_on_restore);
+        assert_eq!(default_config.session.startup_per_agent_delay_ms, 100);
 
         let toml = r#"
 [session]
 resume_agents_on_restore = false
+startup_per_agent_delay_ms = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(config.session.startup_per_agent_delay_ms, 0);
     }
 
     #[test]

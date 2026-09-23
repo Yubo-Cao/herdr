@@ -77,6 +77,12 @@ pub(crate) struct QwenInstallPaths {
 }
 
 #[derive(Debug)]
+pub(crate) struct LettaInstallPaths {
+    pub hook_path: PathBuf,
+    pub settings_path: PathBuf,
+}
+
+#[derive(Debug)]
 pub(crate) struct CursorInstallPaths {
     pub hook_path: PathBuf,
     pub hooks_path: PathBuf,
@@ -134,6 +140,14 @@ pub(crate) struct QwenUninstallResult {
     pub updated_settings: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct LettaUninstallResult {
+    pub hook_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub removed_hook_file: bool,
+    pub updated_settings: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IntegrationStatus {
     pub target: crate::api::schema::IntegrationTarget,
@@ -148,6 +162,17 @@ pub(crate) enum IntegrationStatusKind {
     NotInstalled,
     Current,
     Outdated,
+}
+
+/// Status for an experimental target that is deliberately not part of the
+/// frozen client endpoint `IntegrationTarget` enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExperimentalIntegrationStatus {
+    pub label: &'static str,
+    pub path: PathBuf,
+    pub state: IntegrationStatusKind,
+    pub installed_version: Option<u32>,
+    pub expected_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,10 +259,9 @@ pub(crate) struct DroidUninstallResult {
 pub(crate) struct OpenCodeUninstallResult {
     pub plugin_path: PathBuf,
     pub tui_plugin_path: PathBuf,
-    pub tui_config_path: PathBuf,
     pub removed_plugin: bool,
     pub removed_tui_plugin: bool,
-    pub updated_tui_config: bool,
+    pub updated_tui_configs: Vec<PathBuf>,
 }
 
 #[derive(Debug)]

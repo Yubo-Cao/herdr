@@ -30,6 +30,8 @@ pub(crate) struct HandoffRuntimeState {
     /// Linux cgroup leaf retained across a process-preserving server handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_memory_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
 }
 
 #[cfg(unix)]

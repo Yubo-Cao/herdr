@@ -124,6 +124,7 @@ pub struct App {
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
+    pub(crate) worktree_read_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
@@ -136,8 +137,11 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    startup_per_agent_delay: Duration,
+    next_agent_resume_at: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
     pane_exit_checkpoint_pending: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
@@ -371,9 +375,11 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let (workspaces, active, selected) = if !policy.restore_session {
-            (Vec::new(), None, 0)
-        } else if let Some(snap) = crate::persist::load() {
+        let snapshot = policy.restore_session.then(crate::persist::load).flatten();
+        let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
+            policy.restore_session && snapshot.is_none(),
+        )));
+        let (workspaces, active, selected) = if let Some(snap) = snapshot {
             let history = config
                 .experimental
                 .pane_history
@@ -585,6 +591,7 @@ impl App {
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
             pending_api_worktree_creates: HashMap::new(),
+            worktree_read_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
             pending_worktree_remove_runtime_exits: HashMap::new(),
@@ -599,8 +606,13 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            startup_per_agent_delay: Duration::from_millis(
+                config.session.startup_per_agent_delay_ms.into(),
+            ),
+            next_agent_resume_at: None,
             session_save_deadline: None,
             session_save_thread: None,
+            session_writer,
             pane_exit_checkpoint_pending: false,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
@@ -860,6 +872,16 @@ impl App {
                 self.state.sound = config.ui.sound.clone();
                 self.state.toast_config = config.ui.toast.clone();
             }
+        }
+
+        if !invalid_section("session")
+            && Duration::from_millis(config.session.startup_per_agent_delay_ms.into())
+                != self.startup_per_agent_delay
+        {
+            diagnostics.push(
+                "session.startup_per_agent_delay_ms changes require restarting Herdr; kept current setting"
+                    .into(),
+            );
         }
 
         let graphics_config_valid = !invalid_section("terminal")
@@ -1770,6 +1792,26 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_reports_startup_delay_requires_restart() {
+        let mut app = test_app();
+        let mut config = Config::default();
+        let report = app.apply_live_config(&config, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        config.session.startup_per_agent_delay_ms = 250;
+        let report = app.apply_live_config(&config, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(app.startup_per_agent_delay, Duration::from_millis(100));
+        assert_eq!(report.diagnostics, vec![
+            "session.startup_per_agent_delay_ms changes require restarting Herdr; kept current setting"
+        ]);
+
+        let report = app.apply_live_config(&config, &[], &["session".into()], false);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(app.startup_per_agent_delay, Duration::from_millis(100));
     }
 
     #[test]

@@ -167,6 +167,22 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(super) fn handle_pane_clear(&mut self, id: String, target: PaneTarget) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        match runtime.clear_screen() {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(err) => encode_error(id, "pane_clear_failed", err.to_string()),
+        }
+    }
+
     pub(super) fn handle_pane_scroll(&mut self, id: String, params: PaneScrollParams) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -2350,6 +2366,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_clear_pane_mutates_endpoint_owned_history() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        let request = crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::PaneClear(PaneTarget {
+                pane_id: public_pane_id,
+            }),
+        };
+        assert!(crate::api::request_changes_ui(&request));
+        let response = app.handle_api_request(request);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        assert_eq!(runtime.scroll_metrics().unwrap().max_offset_from_bottom, 0);
+    }
+
+    #[tokio::test]
     async fn api_pane_get_exposes_scroll_metrics() {
         let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
         let runtime = app
@@ -2692,6 +2728,35 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x03]));
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x03]));
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x03]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_keys_preserves_super_chord_in_legacy_pane() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        assert_eq!(
+            app.lookup_runtime_sender(0, internal_pane_id)
+                .unwrap()
+                .keyboard_protocol(),
+            crate::input::KeyboardProtocol::Legacy
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id,
+                keys: vec!["cmd+c".into()],
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[99;9u")
+        );
         assert!(rx.try_recv().is_err());
     }
 

@@ -71,16 +71,22 @@ use terminal_geometry::{
 use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
 use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
-    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
+    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
 };
+
+fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
+    if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
+        warn!(err = %err, "failed to re-assert host mouse capture");
+    }
+}
+
 #[cfg(windows)]
-use terminal_setup::{
-    enable_windows_virtual_terminal_input, is_ssh_session, windows_vti_input_backend_enabled,
-};
+use terminal_setup::{is_ssh_session, windows_vti_input_backend_enabled};
 #[cfg(test)]
 use terminal_setup::{
     should_enable_host_color_scheme_reports, windows_virtual_terminal_input_mode,
-    write_host_color_scheme_report_mode, write_terminal_restore_postlude,
+    windows_win32_input_mode_enabled, write_host_color_scheme_report_mode,
+    write_terminal_restore_postlude,
 };
 
 #[cfg(unix)]
@@ -142,6 +148,10 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
+    // Windows may not have virtual terminal processing enabled until the rendered
+    // client initializes the terminal, so defer the host mouse reset to
+    // `setup_terminal_with_capabilities` instead of emitting raw escapes early.
+    #[cfg(not(windows))]
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell = attach_request.is_none();
     let socket_path = client_socket_path();
@@ -170,7 +180,7 @@ fn run_client_with_mode(
     let endpoint_keybindings = shell_config
         .as_ref()
         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
-    let loop_config = ClientLoopConfig {
+    let mut loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
@@ -179,6 +189,8 @@ fn run_client_with_mode(
         pixel_geometry_enabled,
         pixel_geometry_fallback: kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        host_escape_disambiguation_active: false,
+        initial_host_input: Vec::new(),
         endpoint_keybindings,
         remote_image_paste_key,
         shell_config,
@@ -269,7 +281,7 @@ fn run_client_with_mode(
 
     // The federated shell can show connection notices without any server snapshot.
     let direct_attach = attach_escape.is_some();
-    let terminal_guard = if direct_attach {
+    let mut terminal_guard = if direct_attach {
         setup_direct_attach_terminal(mouse_capture)
     } else {
         setup_terminal(mouse_capture)
@@ -278,6 +290,9 @@ fn run_client_with_mode(
         eprintln!("herdr: failed to set up terminal: {err}");
         err
     })?;
+    loop_config.host_escape_disambiguation_active =
+        terminal_guard.host_escape_disambiguation_active();
+    loop_config.initial_host_input = terminal_guard.take_buffered_host_input();
 
     // Install a panic hook so the foreground client always restores its terminal.
     let panic_restore = terminal_guard.panic_restore();
@@ -316,6 +331,7 @@ fn run_client_with_mode(
             should_quit,
             loop_config,
             attach_escape,
+            &terminal_guard,
         )
         .await
     });
@@ -364,8 +380,9 @@ async fn run_client_loop(
     initial_cell_height_px: u32,
     initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
-    config: ClientLoopConfig,
+    mut config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
+    _terminal_guard: &TerminalGuard,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
@@ -403,6 +420,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         presentation_frozen: false,
+        deferred_local_activation: None,
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
@@ -416,6 +434,17 @@ async fn run_client_loop(
             initial
                 .as_ref()
                 .and_then(|(_, handshake)| handshake.endpoint_methods.clone()),
+        );
+        shell.set_endpoint_agent_view_projection_supported(
+            &endpoint::ClientEndpointId::Local,
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_capabilities.as_ref())
+                .is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| {
+                        capability == crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY
+                    })
+                }),
         );
         if local_unavailable {
             shell.set_endpoint_status(
@@ -452,6 +481,8 @@ async fn run_client_loop(
     let stdin_quit = should_quit.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
     let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
+    let stdin_escape_disambiguation_active = config.host_escape_disambiguation_active;
+    let stdin_initial_host_input = std::mem::take(&mut config.initial_host_input);
     #[cfg(unix)]
     let stdin_direct_response = state.direct_graphics_response.clone();
     #[cfg(unix)]
@@ -467,6 +498,8 @@ async fn run_client_loop(
             will_query_host_cell_size,
             stdin_mouse_capture_active,
             stdin_sgr_pixels_active,
+            stdin_escape_disambiguation_active,
+            stdin_initial_host_input,
             #[cfg(unix)]
             stdin_direct_response,
             #[cfg(unix)]
@@ -513,6 +546,14 @@ async fn run_client_loop(
         } else {
             crate::protocol::MAX_FRAME_SIZE
         };
+        let negotiation = endpoint::EndpointNegotiation::new(
+            handshake.endpoint_methods.unwrap_or_default(),
+            handshake.endpoint_capabilities.unwrap_or_default(),
+        );
+        let surface_reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
+        let surface_delta = negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+        let surface_decoder = (surface_reuse || surface_delta)
+            .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
         let transport = start_endpoint_transport(
             stream,
             (),
@@ -520,11 +561,8 @@ async fn run_client_loop(
             endpoint::ClientEndpointId::Local,
             1,
             max_frame_size,
+            surface_decoder,
         )?;
-        let negotiation = endpoint::EndpointNegotiation::new(
-            handshake.endpoint_methods.unwrap_or_default(),
-            handshake.endpoint_capabilities.unwrap_or_default(),
-        );
         let mut registry = endpoint::EndpointRegistry::new(transport, 1, negotiation);
         if state.shell.is_some() {
             registry.send(&ClientMessage::ClientShellFocus { focused: true });
@@ -768,9 +806,16 @@ async fn run_client_loop(
                             continue;
                         }
                     }
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    if crate::raw_input::events_require_host_mode_refresh(&events) {
+                        refresh_host_mouse_capture(
+                            state.mouse_capture_active,
+                            host_sgr_pixels_active.load(Ordering::Acquire),
+                        );
+                    }
                     let (outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let outcome = shell.handle_input_bytes(&data);
+                        let outcome = shell.handle_raw_events(events);
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
@@ -785,7 +830,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -949,7 +994,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -993,6 +1038,14 @@ async fn run_client_loop(
                     write_stream.active_surface_available(),
                 );
                 if state.shell.is_some() {
+                    if events.iter().any(|event| {
+                        matches!(event, crate::protocol::ClientInputEvent::FocusGained)
+                    }) {
+                        refresh_host_mouse_capture(
+                            state.mouse_capture_active,
+                            host_sgr_pixels_active.load(Ordering::Acquire),
+                        );
+                    }
                     let image_target = state
                         .shell
                         .as_ref()
@@ -1045,7 +1098,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -1069,6 +1122,11 @@ async fn run_client_loop(
                     set_mouse_capture(state.mouse_capture_active, false)
                         .map_err(ClientError::ConnectionFailed)?;
                     host_sgr_pixels_active.store(false, Ordering::Release);
+                } else {
+                    refresh_host_mouse_capture(
+                        state.mouse_capture_active,
+                        host_sgr_pixels_active.load(Ordering::Acquire),
+                    );
                 }
                 state.reported_size = (new_cols, new_rows);
                 state.reported_cell_size = (cell_width_px, cell_height_px);
@@ -1126,6 +1184,7 @@ async fn run_client_loop(
                     }
                     let unavailable = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_status(&endpoint_id, status);
+                        shell.set_machine_diagnostic(&endpoint_id, message.clone());
                         (status == endpoint::ClientEndpointStatus::Attention
                             && shell.endpoint_is_active(&endpoint_id))
                         .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))
@@ -1153,8 +1212,19 @@ async fn run_client_loop(
                     ) {
                         continue;
                     }
+                    let surface_reuse =
+                        negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
+                    let surface_delta =
+                        negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+                    let agent_view_projection_supported = negotiation.supports_capability(
+                        crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY,
+                    );
                     let frame = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
+                        shell.set_endpoint_agent_view_projection_supported(
+                            &endpoint_id,
+                            agent_view_projection_supported,
+                        );
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
                     let reader_quit = writer.stop_handle();
@@ -1168,6 +1238,8 @@ async fn run_client_loop(
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }
+                    let surface_decoder = (surface_reuse || surface_delta)
+                        .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
                     let reader_tx = event_tx.clone();
                     std::thread::spawn(move || {
                         server_reader_thread(
@@ -1177,6 +1249,7 @@ async fn run_client_loop(
                             MAX_GRAPHICS_FRAME_SIZE,
                             endpoint_id,
                             generation,
+                            surface_decoder,
                         );
                     });
                 }
@@ -1202,7 +1275,7 @@ async fn run_client_loop(
                     target,
                     force,
                     now,
-                    &event_tx,
+                    &mut scheduled_activation,
                 )?;
             }
             ClientLoopEvent::ServerMessage {
@@ -1683,7 +1756,7 @@ async fn run_client_loop(
                             &mut write_stream,
                             state.shell.as_mut(),
                             &mut state.detached_process_children,
-                            &event_tx,
+                            &mut scheduled_activation,
                         )?;
                         let repaint = repaint || dispatch_repaint;
                         if replay_mouse.is_empty() {
@@ -1715,7 +1788,7 @@ async fn run_client_loop(
                                 &mut pending_activation,
                                 &mut endpoint_commands,
                                 &mut prefix_input_source,
-                                &event_tx,
+                                &mut scheduled_activation,
                             )? {
                                 return Ok(());
                             }
@@ -1765,17 +1838,21 @@ async fn run_client_loop(
                         );
                         let mouse_mode_changed = enabled != state.mouse_capture_active
                             || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
+                        }
                         if mouse_mode_changed {
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
                             set_mouse_capture(enabled, next_sgr_pixels)
                                 .map_err(ClientError::ConnectionFailed)?;
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
+                        }
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
                         }
                         state.mouse_capture_active = enabled;
                         host_mouse_capture_active.store(enabled, Ordering::Release);
@@ -1825,6 +1902,28 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::AgentViewProjection(
+                                projection,
+                            )) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_agent_view_projection_for_generation(
+                                        &endpoint_id,
+                                        generation,
+                                        projection,
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::AgentCompletions(projection)) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_agent_completions(
+                                        &endpoint_id,
+                                        generation,
+                                        projection,
+                                    );
+                                }
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::Ignored) => {
                                 debug!(%kind, "ignoring unknown endpoint control message");
                                 continue;
@@ -1889,6 +1988,14 @@ async fn run_client_loop(
                             }
                         }
                         write_stream.mark_ready(&endpoint_id, generation);
+                        if endpoint_id.is_local() {
+                            if let Some(event) =
+                                take_ready_local_activation(&mut state, &write_stream)
+                            {
+                                scheduled_activation = Some(event);
+                                continue;
+                            }
+                        }
                         let selected_endpoint = endpoint_catalog
                             .selected_profile
                             .as_ref()
@@ -1905,7 +2012,11 @@ async fn run_client_loop(
                         let needs_surface = write_stream
                             .connection(&selected_endpoint)
                             .is_some_and(|connection| !connection.surface_active);
-                        if activation_ready && needs_surface && pending_activation.is_none() {
+                        if activation_ready
+                            && needs_surface
+                            && pending_activation.is_none()
+                            && state.deferred_local_activation.is_none()
+                        {
                             scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
                                 endpoint_id: selected_endpoint,
                                 target: None,
@@ -2022,7 +2133,10 @@ async fn run_client_loop(
                             outcome.actions.extend(actions);
                         }
                         let (effects, notification_repaint) = shell.tick_notifications(now);
-                        outcome.repaint |= notification_repaint | shell.tick_copy_feedback(now);
+                        outcome.repaint |= notification_repaint
+                            | shell.tick_copy_feedback(now)
+                            | shell.tick_workspace_highlight(now)
+                            | shell.tick_endpoint_error(now);
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
@@ -2038,7 +2152,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }

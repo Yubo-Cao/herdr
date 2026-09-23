@@ -24,6 +24,9 @@ use crate::ipc::{
 
 mod pane_graphics_stream;
 
+#[cfg(test)]
+mod subscription_socket_tests;
+
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,13 +74,14 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        ssh_agent_registration: false,
     })
 }
 
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
+    mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
@@ -87,6 +91,31 @@ fn start_server_inner(
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
+
+    #[cfg(unix)]
+    let ssh_agents = match crate::platform::ssh_agent::SshAgentRegistry::new(
+        crate::platform::ssh_agent::socket_path(),
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+    ) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            warn!(%error, "SSH agent refresh unavailable; retaining inherited pane environment");
+            None
+        }
+    };
+
+    if let Some(capabilities) = capabilities.as_mut() {
+        capabilities.ssh_agent_registration = {
+            #[cfg(unix)]
+            {
+                ssh_agents.is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
@@ -99,6 +128,8 @@ fn start_server_inner(
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    #[cfg(unix)]
+                    let ssh_agents = ssh_agents.clone();
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
                             stream,
@@ -107,6 +138,8 @@ fn start_server_inner(
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
+                            #[cfg(unix)]
+                            ssh_agents.as_ref(),
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -150,7 +183,16 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
+    handle_connection_with_stop(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        None,
+        #[cfg(unix)]
+        None,
+    )
 }
 
 fn handle_connection_with_stop(
@@ -160,6 +202,7 @@ fn handle_connection_with_stop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -177,10 +220,23 @@ fn handle_connection_with_stop(
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
+            // Recover correlation without relaxing typed request validation or accepting
+            // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
+            #[derive(serde::Deserialize)]
+            struct RequestId {
+                id: String,
+            }
+            let id = if line.starts_with('{') {
+                serde_json::from_str::<RequestId>(line)
+                    .map(|request| request.id)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
-                    id: String::new(),
+                    id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
@@ -197,6 +253,49 @@ fn handle_connection_with_stop(
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
+        #[cfg(unix)]
+        Method::ServerSshAgentRegister(params) => {
+            let lease = ssh_agents
+                .ok_or_else(|| io::Error::other("SSH agent registration is unavailable"))
+                .and_then(|registry| registry.register(PathBuf::from(params.socket_path)));
+            let lease = match lease {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return write_text_line_allow_disconnect(
+                        &mut stream,
+                        &error_response_json(
+                            request_id,
+                            if error.kind() == io::ErrorKind::InvalidInput {
+                                "invalid_ssh_agent"
+                            } else {
+                                "ssh_agent_unavailable"
+                            },
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            write_json_line(
+                &mut stream,
+                &SuccessResponse {
+                    id: request_id,
+                    result: ResponseResult::Ok {},
+                },
+            )?;
+            set_local_stream_polling(&mut stream, true)?;
+            let mut byte = [0];
+            while running.load(Ordering::Relaxed) {
+                match poll_local_stream_read(&mut stream, &mut byte)? {
+                    LocalStreamRead::Pending => {
+                        // SSH can unlink an inherited socket after its bridge's lease closes.
+                        lease.refresh()?;
+                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    }
+                    _ => break,
+                }
+            }
+            Ok(())
+        }
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
@@ -388,6 +487,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
         Method::ServerReloadConfig(_) => "server.reload_config",
+        Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::NotificationShow(_) => "notification.show",
@@ -450,6 +550,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
         Method::PaneScroll(_) => "pane.scroll",
+        Method::PaneClear(_) => "pane.clear",
         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
         Method::PaneSelectionRead(_) => "pane.selection.read",
         Method::PaneCopyMotion(_) => "pane.copy_motion",
@@ -460,6 +561,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
         Method::PaneLinkActivate(_) => "pane.link.activate",
+        Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
@@ -723,7 +825,8 @@ fn stream_subscriptions(
             event_start_sequence,
         ) {
             Ok(active) => active,
-            Err(response) => {
+            Err(mut response) => {
+                response.id = request_id;
                 if let Err(err) = write_json_line(&mut stream, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -739,7 +842,7 @@ fn stream_subscriptions(
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
+            id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted {},
         },
     ) {
@@ -755,7 +858,23 @@ fn stream_subscriptions(
         }
 
         for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
+            let events = match subscription.poll_batch(api_tx, event_hub) {
+                Ok(events) => events,
+                Err(error) => {
+                    write_json_line_allow_disconnect(
+                        &mut stream,
+                        &ErrorResponse {
+                            id: request_id,
+                            error,
+                        },
+                    )?;
+                    return Ok(());
+                }
+            };
+            for event in events {
+                if should_stop_connection(&mut stream, running)? {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -962,7 +1081,7 @@ mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{Mutex, OnceLock};
@@ -996,6 +1115,53 @@ mod tests {
         (client, server, path)
     }
 
+    #[test]
+    fn ssh_agent_registration_lasts_only_for_the_api_connection() {
+        let directory = unique_test_path("agent-lease");
+        fs::create_dir(&directory).unwrap();
+        let agent = directory.join("upstream");
+        let _agent = UnixListener::bind(&agent).unwrap();
+        let stable = directory.join("stable");
+        let registry =
+            crate::platform::ssh_agent::SshAgentRegistry::new(stable.clone(), None).unwrap();
+        let (mut client, server, api_path) = local_stream_pair("agent-api");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_stop(
+                server,
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                Some(&worker_registry),
+            )
+            .unwrap();
+        });
+        write_json_line(
+            &mut client,
+            &Request {
+                id: "agent-lease".into(),
+                method: Method::ServerSshAgentRegister(
+                    crate::api::schema::ServerSshAgentRegisterParams {
+                        socket_path: agent.to_string_lossy().into_owned(),
+                    },
+                ),
+            },
+        )
+        .unwrap();
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+        assert_eq!(fs::read_link(&stable).unwrap(), agent);
+        drop(client);
+        worker.join().unwrap();
+        assert!(!stable.exists());
+        drop(registry);
+        fs::remove_file(api_path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn pane_info(
         pane_id: &str,
         agent_status: crate::api::schema::AgentStatus,
@@ -1008,6 +1174,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            restore_error: None,
             label: None,
             agent: Some("pi".into()),
             title: None,
@@ -1156,6 +1323,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                ssh_agent_registration: false,
             }),
             None,
             None,
@@ -1444,6 +1612,95 @@ mod tests {
     }
 
     #[test]
+    fn invalid_requests_preserve_only_unambiguous_string_ids() {
+        let cases = [
+            (
+                r#"{"id":"mine","method":"pane.report_agent","params":{"pane_id":"w1:p1","status":"working","source":"x"}}"#,
+                "mine",
+            ),
+            (r#"{"id":"escaped\"id","method":"unknown"}"#, "escaped\"id"),
+            (r#"{"method":"unknown","params":{"id":"nested"}}"#, ""),
+            (r#"{"id":123,"method":"unknown"}"#, ""),
+            (
+                r#"{"id":"first","id":"second","method":"ping","params":{}}"#,
+                "",
+            ),
+            (r#"{"id":"truncated","method":"ping""#, ""),
+            (r#"["not-an-object"]"#, ""),
+        ];
+        for (request, expected_id) in cases {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+            let (mut client, server, path) = local_stream_pair("invalid-request-id");
+            writeln!(client, "{request}").unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+
+            let mut response = String::new();
+            BufReader::new(client)
+                .read_to_string(&mut response)
+                .unwrap();
+            let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.id, expected_id, "{request}");
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(response.error.message.starts_with("invalid request: "));
+            assert!(
+                api_rx.try_recv().is_err(),
+                "invalid requests must not dispatch"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_setup_errors_preserve_request_id_and_reject_entire_stream() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::default();
+        let responder_event_hub = event_hub.clone();
+        let responder = std::thread::spawn(move || {
+            let msg = api_rx.blocking_recv().unwrap();
+            let Method::PaneGet(params) = msg.request.method else {
+                panic!("unexpected request: {:?}", msg.request.method);
+            };
+            assert_eq!(params.pane_id, "w999:p9");
+            responder_event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneClosed,
+                data: crate::api::schema::EventData::PaneClosed {
+                    pane_id: "w999:p9".into(),
+                    workspace_id: "w999".into(),
+                },
+            });
+            msg.respond_to
+                .send(error_response_json(
+                    msg.request.id,
+                    "pane_not_found",
+                    "pane w999:p9 not found".into(),
+                ))
+                .unwrap();
+            assert!(
+                api_rx.blocking_recv().is_none(),
+                "rejection must not start polling"
+            );
+        });
+        let (mut client, server, path) = local_stream_pair("subscription-error-id");
+        let request = r#"{"id":"panefold:events","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"},{"type":"pane.closed"},{"type":"pane.agent_status_changed","pane_id":"w999:p9"}]}}"#;
+        writeln!(client, "{request}").unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+
+        let mut response = String::new();
+        BufReader::new(client)
+            .read_to_string(&mut response)
+            .unwrap();
+        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.id, "panefold:events");
+        assert_eq!(response.error.code, "pane_not_found");
+        assert_eq!(response.error.message, "pane w999:p9 not found");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn subscriptions_stop_when_client_disconnects() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
@@ -1467,6 +1724,7 @@ mod tests {
         let ack = read_line(&mut client);
         let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["id"], "sub_1");
 
         drop(client);
 
