@@ -31,6 +31,19 @@ pub const AGENT_VIEW_PROJECTION_CAPABILITY: &str = "agent_view_projection";
 pub const AGENT_VIEW_PROJECTION_KIND: &str = "endpoint.agent-view.v1";
 pub const AGENT_COMPLETIONS_CAPABILITY: &str = "agent_completions";
 pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
+/// The server honors `input_claims_geometry` in the hello and the
+/// `endpoint.input-geometry.v1` control. Without it, pane input from a shell
+/// always makes that shell the foreground client and its tab's size owner.
+pub const INPUT_GEOMETRY_CAPABILITY: &str = "input_geometry";
+pub const INPUT_GEOMETRY_KIND: &str = "endpoint.input-geometry.v1";
+
+/// Whether later pane and popup input from this shell may take foreground and
+/// tab-geometry ownership. A client relaying input typed on another device
+/// (for example a phone while a tablet keeps the size) turns it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointInputGeometry {
+    pub claims_geometry: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointAgentCompletions {
@@ -61,6 +74,10 @@ pub struct EndpointClientHello {
     /// Accept the optional surface-delta encoding on this connection.
     #[serde(default)]
     pub surface_delta: bool,
+    /// Pane input claims foreground and tab-geometry ownership (the default).
+    /// Honored only by servers advertising `input_geometry`.
+    #[serde(default = "default_true")]
+    pub input_claims_geometry: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -170,6 +187,7 @@ impl EndpointServerWelcome {
                 HEALTH_CHECK_CAPABILITY.into(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
+                INPUT_GEOMETRY_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -210,6 +228,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            input_claims_geometry: true,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -377,8 +396,37 @@ mod tests {
                 HEALTH_CHECK_CAPABILITY.to_string(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
+                INPUT_GEOMETRY_CAPABILITY.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn hello_input_geometry_defaults_to_claiming_and_decodes_opt_out() {
+        let mut value = serde_json::to_value(hello()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("input_claims_geometry");
+        let decoded: EndpointClientHello = serde_json::from_value(value.clone()).unwrap();
+        assert!(decoded.input_claims_geometry);
+
+        value["input_claims_geometry"] = serde_json::json!(false);
+        let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
+        assert!(!decoded.input_claims_geometry);
+    }
+
+    #[test]
+    fn input_geometry_control_requires_its_field() {
+        let control: EndpointInputGeometry =
+            serde_json::from_str(r#"{"claims_geometry":false,"future":1}"#).unwrap();
+        assert_eq!(
+            control,
+            EndpointInputGeometry {
+                claims_geometry: false
+            }
+        );
+        assert!(serde_json::from_str::<EndpointInputGeometry>("{}").is_err());
     }
 
     #[test]

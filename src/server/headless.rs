@@ -942,6 +942,13 @@ impl HeadlessServer {
         changed
     }
 
+    /// Whether pane input from this shell may take foreground and tab-geometry ownership.
+    fn shell_input_claims_geometry(&self, client_id: u64) -> bool {
+        self.clients
+            .get(&client_id)
+            .is_none_or(|client| client.shell_input_claims_geometry)
+    }
+
     fn promote_latest_remaining_client(&mut self) -> bool {
         let next_foreground = latest_shell_client(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
@@ -1345,8 +1352,9 @@ impl HeadlessServer {
                 {
                     return false;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let claims = self.shell_input_claims_geometry(client_id);
+                let foreground_changed = claims && self.promote_client_to_foreground(client_id);
+                let geometry_changed = claims && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -1385,8 +1393,9 @@ impl HeadlessServer {
                 {
                     return false;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let claims = self.shell_input_claims_geometry(client_id);
+                let foreground_changed = claims && self.promote_client_to_foreground(client_id);
+                let geometry_changed = claims && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };
@@ -2464,6 +2473,17 @@ impl HeadlessServer {
                 client.host_mouse_capture_active = None;
                 true
             }
+            ServerEvent::ClientShellInputGeometry {
+                client_id,
+                claims_geometry,
+            } => {
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    if matches!(client.mode, ClientConnectionMode::ClientShell) {
+                        client.shell_input_claims_geometry = claims_geometry;
+                    }
+                }
+                false
+            }
             ServerEvent::ClientShellPresentationSync { client_id, token } => {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
@@ -2562,7 +2582,8 @@ impl HeadlessServer {
                     }
                     return runtime.scroll_metrics() != scroll_before;
                 }
-                let interaction = client_pane_input_has_interaction(&events);
+                let interaction = client_pane_input_has_interaction(&events)
+                    && self.shell_input_claims_geometry(client_id);
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
@@ -2642,7 +2663,8 @@ impl HeadlessServer {
                     }
                     return runtime.scroll_metrics() != scroll_before;
                 }
-                let interaction = client_pane_input_has_interaction(&events);
+                let interaction = client_pane_input_has_interaction(&events)
+                    && self.shell_input_claims_geometry(client_id);
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.track_shell_input(
                         ClientShellInputTarget::Popup(terminal_id.clone()),

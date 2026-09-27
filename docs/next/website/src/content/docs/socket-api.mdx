@@ -983,6 +983,14 @@ only those actions and show a client-local notice; they do not disconnect the UI
 or timed-out actions are also reported without ending the connection. Servers
 from before endpoint generation 1 need one final update.
 
+Pane input from a client normally makes it the foreground client and the size owner of its
+tab. A client that relays input typed on another device, such as a phone while a tablet keeps
+the size, can opt out on servers advertising the `input_geometry` capability: send
+`"input_claims_geometry": false` in the hello, or the `endpoint.input-geometry.v1` control
+with `{"claims_geometry": false}` before the input. The setting applies to later pane and popup
+input on that connection until changed; resize, focus, and navigation still claim as before.
+Older servers ignore both and keep the default.
+
 The numbered binary protocol remains for same-install and internal operations,
 including direct terminal attach and live handoff. Check `ping` or `herdr status`
 before using those operations across different builds. JSON API clients should

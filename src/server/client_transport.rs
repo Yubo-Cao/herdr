@@ -503,6 +503,12 @@ pub(crate) enum ServerEvent {
     ClientShellMouseCapture { client_id: u64, enabled: bool },
     /// The committed shell asks the server to replay presentation effects before input resumes.
     ClientShellPresentationSync { client_id: u64, token: String },
+    /// A client-owned shell chose whether its later pane input may claim
+    /// foreground and tab-geometry ownership.
+    ClientShellInputGeometry {
+        client_id: u64,
+        claims_geometry: bool,
+    },
     /// A client-owned shell invoked one endpoint operation through this connection.
     ClientShellEndpointRequest {
         client_id: u64,
@@ -767,6 +773,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_active,
                     hello.surface_reuse,
                     hello.surface_delta,
+                    hello.input_claims_geometry,
                 )),
             )
         }
@@ -855,6 +862,7 @@ pub(crate) fn handle_client_handshake(
 
     // Notify the main loop about the new client.
     let endpoint_control_writer = shell_options.as_ref().map(|_| writer.control.clone());
+    let mut input_geometry_opt_out = false;
     let connected = if let Some((
         pixel_mouse,
         direct_graphics,
@@ -863,8 +871,10 @@ pub(crate) fn handle_client_handshake(
         surface_active,
         surface_reuse,
         surface_delta,
+        input_claims_geometry,
     )) = shell_options
     {
+        input_geometry_opt_out = !input_claims_geometry;
         ServerEvent::ClientShellConnected {
             client_id,
             surface_cols: client_cols,
@@ -899,6 +909,13 @@ pub(crate) fn handle_client_handshake(
             }
             _ => {}
         }
+    } else if input_geometry_opt_out {
+        // Ordered after the connect event on the same channel, so no pane
+        // input from this shell is handled before the opt-out applies.
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientShellInputGeometry {
+            client_id,
+            claims_geometry: false,
+        });
     }
 
     // Enter read loop — read client messages and forward to main loop.
@@ -1324,6 +1341,22 @@ fn client_read_loop_with_endpoint_controls(
                     token: data,
                 }
             }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == crate::protocol::endpoint::INPUT_GEOMETRY_KIND =>
+            {
+                match serde_json::from_str::<crate::protocol::endpoint::EndpointInputGeometry>(
+                    &data,
+                ) {
+                    Ok(control) => ServerEvent::ClientShellInputGeometry {
+                        client_id,
+                        claims_geometry: control.claims_geometry,
+                    },
+                    Err(error) => {
+                        debug!(client_id, %error, "ignoring malformed input geometry control");
+                        continue;
+                    }
+                }
+            }
             ClientMessage::EndpointControl { kind, data } => {
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)
                 else {
@@ -1454,6 +1487,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            input_claims_geometry: true,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1986,6 +2020,79 @@ mod tests {
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn client_shell_input_geometry_opt_out_follows_connect_and_controls_update_it() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-shell-input-geometry");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(8);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 44, &server_event_tx, &handshake_quit)
+        });
+
+        let ClientMessage::EndpointControl { kind, data } = endpoint_hello(80, 29) else {
+            unreachable!();
+        };
+        let mut hello: serde_json::Value = serde_json::from_str(&data).unwrap();
+        hello["input_claims_geometry"] = serde_json::json!(false);
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind,
+                data: hello.to_string(),
+            },
+        )
+        .expect("write shell hello");
+        let welcome = endpoint_welcome(
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome"),
+        );
+        assert!(welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::protocol::endpoint::INPUT_GEOMETRY_CAPABILITY));
+        match server_event_rx.blocking_recv().expect("connected") {
+            ServerEvent::ClientShellConnected { writer, .. } => drop(writer),
+            other => panic!("expected ClientShellConnected, got {other:?}"),
+        }
+        match server_event_rx.blocking_recv().expect("hello opt-out") {
+            ServerEvent::ClientShellInputGeometry {
+                client_id: 44,
+                claims_geometry: false,
+            } => {}
+            other => panic!("expected input geometry opt-out, got {other:?}"),
+        }
+
+        for data in ["not json", r#"{"claims_geometry":true}"#] {
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::EndpointControl {
+                    kind: crate::protocol::endpoint::INPUT_GEOMETRY_KIND.into(),
+                    data: data.into(),
+                },
+            )
+            .expect("write input geometry control");
+        }
+        // The malformed control is skipped; the valid one arrives next.
+        match server_event_rx
+            .blocking_recv()
+            .expect("input geometry control")
+        {
+            ServerEvent::ClientShellInputGeometry {
+                client_id: 44,
+                claims_geometry: true,
+            } => {}
+            other => panic!("expected input geometry control, got {other:?}"),
         }
 
         drop(client_stream);

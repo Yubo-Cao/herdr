@@ -192,6 +192,10 @@ pub(crate) struct ClientConnection {
     pub(crate) shell_deferred_navigation_response: Option<Vec<u8>>,
     /// Whether this shell uses the endpoint-owned keymap rather than a client-owned keymap.
     pub(crate) shell_uses_endpoint_keybindings: bool,
+    /// Whether pane and popup input from this shell takes foreground and tab-geometry
+    /// ownership. A shell relaying input typed on another device turns this off so the
+    /// device that displays the tab keeps its size.
+    pub(crate) shell_input_claims_geometry: bool,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -255,6 +259,7 @@ impl ClientConnection {
             shell_deferred_navigation_request_id: None,
             shell_deferred_navigation_response: None,
             shell_uses_endpoint_keybindings: false,
+            shell_input_claims_geometry: true,
             writer,
         }
     }

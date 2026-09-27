@@ -2435,6 +2435,113 @@ async fn geometry_reapply_replaces_a_controller_that_left_the_tab() {
 }
 
 #[tokio::test]
+async fn shell_input_without_geometry_claim_keeps_the_displaying_client_size() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("input-geometry");
+    let pane = workspace.tabs[0].root_pane;
+    let (runtime, mut input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"", 4);
+    workspace.insert_test_runtime(pane, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let pane_id = server.app.public_pane_id(0, pane).unwrap();
+    let tab_id = server.app.public_tab_id(0, 0).unwrap();
+    let text = |value: &str| ServerEvent::ClientShellPaneInput {
+        client_id: 0,
+        pane_id: pane_id.clone(),
+        events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+            value.into(),
+        )],
+    };
+    let from = |client_id: u64, event: ServerEvent| match event {
+        ServerEvent::ClientShellPaneInput {
+            pane_id, events, ..
+        } => ServerEvent::ClientShellPaneInput {
+            client_id,
+            pane_id,
+            events,
+        },
+        other => other,
+    };
+
+    // The tablet displays the tab; the relay forwards input typed on a phone.
+    let (tablet_control, _tablet_render) = connect_test_shell(&mut server, 31, 120, 40);
+    let _ = tablet_control.recv().expect("tablet snapshot");
+    let (relay_control, _relay_render) = connect_test_shell(&mut server, 32, 50, 30);
+    let _ = relay_control.recv().expect("relay snapshot");
+    server.handle_server_event(from(31, text("t")));
+    assert_eq!(input.try_recv().expect("tablet input"), Bytes::from("t"));
+    assert_eq!(server.foreground_client_id, Some(31));
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&31));
+    let tablet_size = server.app.state.workspaces[0].test_runtimes[&pane].current_size();
+
+    server.handle_server_event(ServerEvent::ClientShellInputGeometry {
+        client_id: 32,
+        claims_geometry: false,
+    });
+    server.handle_server_event(from(32, text("phone")));
+    assert_eq!(
+        input.try_recv().expect("relayed input"),
+        Bytes::from("phone")
+    );
+    assert_eq!(server.foreground_client_id, Some(31));
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&31));
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&pane].current_size(),
+        tablet_size
+    );
+
+    // Opting back in restores the stock behavior: typing claims the size.
+    server.handle_server_event(ServerEvent::ClientShellInputGeometry {
+        client_id: 32,
+        claims_geometry: true,
+    });
+    server.handle_server_event(from(32, text("resize")));
+    assert_eq!(
+        input.try_recv().expect("claiming input"),
+        Bytes::from("resize")
+    );
+    assert_eq!(server.foreground_client_id, Some(32));
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&32));
+    assert_ne!(
+        server.app.state.workspaces[0].test_runtimes[&pane].current_size(),
+        tablet_size
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn input_geometry_control_is_ignored_for_unknown_and_non_shell_clients() {
+    let mut server = test_headless_server();
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellInputGeometry {
+            client_id: 99,
+            claims_geometry: false,
+        })
+    );
+    server.clients.insert(
+        12,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::TerminalAttach {
+                terminal_id: "terminal".into(),
+            },
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::TerminalAnsi,
+            None,
+        ),
+    );
+    server.handle_server_event(ServerEvent::ClientShellInputGeometry {
+        client_id: 12,
+        claims_geometry: false,
+    });
+    assert!(server.clients[&12].shell_input_claims_geometry);
+}
+
+#[tokio::test]
 async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("independent-geometry");
