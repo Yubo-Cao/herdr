@@ -61,6 +61,10 @@ struct SharedPtyControls {
     resize: Option<PtyResizeRequest>,
     nudge: Option<PtyResize>,
     terminal_responses: Vec<Bytes>,
+    /// Experimental multi-size viewing: the PTY size last applied on the actor
+    /// thread, packed as `cols << 16 | rows`. Reads on this thread after the
+    /// ioctl therefore observe the size the child was signalled with.
+    applied_size: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 pub(crate) struct PtyIoActorConfig {
@@ -174,6 +178,13 @@ impl PtyIoActorHandle {
             })?;
         self.wake_actor();
         Ok(reply_rx)
+    }
+
+    pub(crate) fn observe_applied_size(&self, cell: Arc<std::sync::atomic::AtomicU32>) {
+        self.controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .applied_size = Some(cell);
     }
 
     pub(crate) fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
@@ -789,7 +800,7 @@ impl PtyIoActorRunner {
     }
 
     fn apply_pending_controls(&mut self) {
-        let (resize, nudge, terminal_responses) = {
+        let (resize, nudge, terminal_responses, applied_size) = {
             let mut controls = self
                 .controls
                 .lock()
@@ -798,17 +809,28 @@ impl PtyIoActorRunner {
                 controls.resize.take(),
                 controls.nudge.take(),
                 std::mem::take(&mut controls.terminal_responses),
+                controls.applied_size.clone(),
             )
         };
         if self.state == ActorState::Released {
             return;
         }
+        let record_applied = |size: PtyResize| {
+            if let Some(cell) = &applied_size {
+                cell.store(
+                    (u32::from(size.cols) << 16) | u32::from(size.rows),
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+        };
         if let Some(request) = resize {
             self.resize(request.resize);
+            record_applied(request.resize);
             self.enqueue_terminal_responses(request.terminal_responses);
         }
         if let Some(nudge) = nudge {
             self.nudge(nudge);
+            record_applied(nudge);
         }
         self.enqueue_terminal_responses(terminal_responses);
     }

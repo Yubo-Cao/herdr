@@ -28,6 +28,7 @@ mod agent_detection;
 mod cursor;
 mod input;
 mod kitty_keyboard;
+pub(crate) mod multisize;
 mod osc;
 mod state;
 mod terminal;
@@ -1335,6 +1336,13 @@ pub struct PaneRuntime {
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
+    /// Experimental multi-size viewing (`HERDR_EXPERIMENTAL_MULTISIZE=1`).
+    multisize: Option<PaneMultiSize>,
+}
+
+struct PaneMultiSize {
+    state: Arc<multisize::MultiSize<PaneTerminal>>,
+    task: tokio::task::AbortHandle,
 }
 
 enum PaneRuntimeIo {
@@ -1346,7 +1354,59 @@ enum PaneRuntimeIo {
     },
 }
 
+/// Applies `(rows, cols, cell_width_px, cell_height_px)` to the PTY only.
+type MultiSizeResizeFn = Box<dyn Fn(u16, u16, u32, u32) + Send>;
+
+/// Drives the multi-size slot schedule for one pane: every tick it asks the
+/// scheduler whether the PTY should move to another viewer size and applies
+/// that size to the PTY only (the primary emulator keeps the controller size).
+/// The scheduler task holds its own actor handle clone.
+fn spawn_multisize_task(
+    state: Arc<multisize::MultiSize<PaneTerminal>>,
+    terminal: Arc<PaneTerminal>,
+    io: &PaneRuntimeIo,
+) -> tokio::task::AbortHandle {
+    let resize: Option<MultiSizeResizeFn> = match io {
+        PaneRuntimeIo::Actor(actor) => {
+            let actor = actor.clone();
+            Some(Box::new(move |rows, cols, cw, ch| {
+                actor.resize(rows, cols, cw, ch, Vec::new());
+            }))
+        }
+        #[cfg(test)]
+        PaneRuntimeIo::TestChannel { .. } => None,
+    };
+    tokio::spawn(async move {
+        let Some(resize) = resize else {
+            return;
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if !state.has_classes() {
+                continue;
+            }
+            let alternate_screen = terminal.alternate_screen_active();
+            if let Some(size) = state.tick(std::time::Instant::now(), alternate_screen) {
+                let (cw, ch) = state.cell_px();
+                resize(size.rows, size.cols, cw, ch);
+            }
+        }
+    })
+    .abort_handle()
+}
+
 impl PaneRuntimeIo {
+    #[cfg(unix)]
+    fn observe_applied_size(&self, cell: Arc<AtomicU32>) {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.observe_applied_size(cell),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => {}
+        }
+    }
+
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
@@ -1521,6 +1581,9 @@ impl Drop for PaneRuntime {
         // The PTY actor shuts down before the process/session policy runs.
         if let Some(handle) = &self.detect_handle {
             handle.abort();
+        }
+        if let Some(multisize) = &self.multisize {
+            multisize.task.abort();
         }
         self.compression.abort();
         self.io.shutdown();
@@ -2052,6 +2115,9 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
+        if let Some(multisize) = self.multisize.take() {
+            multisize.task.abort();
+        }
         self.compression.abort();
         self.io.shutdown();
         shutdown_pane_processes(
@@ -2079,6 +2145,9 @@ impl PaneRuntime {
         }
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
+        }
+        if let Some(multisize) = self.multisize.take() {
+            multisize.task.abort();
         }
         self.compression.abort();
         self.preserve_processes_on_drop = true;
@@ -2504,6 +2573,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(detect_handle),
+            multisize: None,
         })
     }
 
@@ -2595,6 +2665,24 @@ impl PaneRuntime {
         let resource_controller =
             crate::agent_resources::PaneResourceController::new(pane_id, child_pid.clone(), None);
 
+        let multisize_state = multisize::enabled().then(|| {
+            let make_response_tx = response_tx.clone();
+            Arc::new(multisize::MultiSize::new(
+                multisize::GridSize::new(cols, rows),
+                multisize::SlotPolicy::default(),
+                Box::new(move |size: multisize::GridSize| {
+                    let terminal =
+                        crate::ghostty::Terminal::new(size.cols, size.rows, scrollback_limit_bytes)
+                            .ok()?;
+                    let shadow =
+                        GhosttyPaneTerminal::new(terminal, make_response_tx.clone()).ok()?;
+                    shadow.apply_host_terminal_theme(host_terminal_theme);
+                    let _ = shadow.apply_host_terminal_appearance(host_terminal_appearance);
+                    Some(PaneTerminal::new(shadow))
+                }),
+            ))
+        });
+
         let io = {
             let terminal = terminal.clone();
             let response_writer = response_tx.clone();
@@ -2608,7 +2696,30 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let multisize_for_read = multisize_state.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
+                if let Some(shadow) = multisize_for_read
+                    .as_ref()
+                    .and_then(|state| state.route_read(std::time::Instant::now()))
+                {
+                    // Bytes painted for a secondary viewer size go only to its
+                    // shadow emulator; the primary keeps its last frame.
+                    let _content_write_guard = content_write_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    content_seq.fetch_add(1, Ordering::AcqRel);
+                    let shell_pid = child_pid.load(Ordering::Acquire);
+                    let result =
+                        shadow.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                    content_seq.fetch_add(1, Ordering::Release);
+                    drop(_content_write_guard);
+                    if render_dirty.request_pty(pane_id) {
+                        render_notify.notify_one();
+                    }
+                    return PtyReadResult {
+                        terminal_responses: result.terminal_responses,
+                    };
+                }
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -2667,6 +2778,13 @@ impl PaneRuntime {
                 on_reader_exit: None,
             })?)
         };
+
+        let multisize = multisize_state.map(|state| {
+            #[cfg(unix)]
+            io.observe_applied_size(state.applied_size_cell());
+            let task = spawn_multisize_task(state.clone(), terminal.clone(), &io);
+            PaneMultiSize { state, task }
+        });
 
         // --- Detection task ---
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
@@ -3110,6 +3228,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             compression,
             detect_handle,
+            multisize,
         })
     }
 
@@ -3163,6 +3282,13 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
+        if let Some(multisize) = &self.multisize {
+            multisize.state.set_primary(
+                multisize::GridSize::new(cols, rows),
+                cell_width_px,
+                cell_height_px,
+            );
+        }
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -3315,7 +3441,10 @@ impl PaneRuntime {
         if !show_cursor {
             return None;
         }
-        let cursor = self.terminal.cursor_state()?;
+        let cursor = match self.multisize_shadow_for(area) {
+            Some(shadow) => shadow.cursor_state()?,
+            None => self.terminal.cursor_state()?,
+        };
         if cursor.x >= area.width || cursor.y >= area.height {
             return None;
         }
@@ -3401,7 +3530,26 @@ impl PaneRuntime {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        if let Some(shadow) = self.multisize_shadow_for(area) {
+            shadow.render(frame, area, show_cursor);
+            return;
+        }
         self.terminal.render(frame, area, show_cursor);
+    }
+
+    /// Shadow emulator for a viewer whose pane area is a secondary size class.
+    fn multisize_shadow_for(&self, area: Rect) -> Option<Arc<PaneTerminal>> {
+        let multisize = self.multisize.as_ref()?;
+        multisize.state.shadow_for_viewer(
+            multisize::GridSize::new(area.width, area.height),
+            std::time::Instant::now(),
+        )
+    }
+
+    fn note_multisize_input(&self) {
+        if let Some(multisize) = &self.multisize {
+            multisize.state.note_input(std::time::Instant::now());
+        }
     }
 
     pub(crate) fn collect_dirty_patch_snapshot(
@@ -3409,6 +3557,15 @@ impl PaneRuntime {
         area_width: u16,
         area_height: u16,
     ) -> Option<TerminalDirtyPatchSnapshot> {
+        // Retained patches come from the primary emulator only; viewers of a
+        // secondary size class need the full per-client render path.
+        if self
+            .multisize
+            .as_ref()
+            .is_some_and(|multisize| multisize.state.has_classes())
+        {
+            return None;
+        }
         // PTY/resize writers announce changes before locking the terminal core.
         // Exclude them until rows and metadata have been paired with their revision.
         let _content_guard = self
@@ -3485,6 +3642,7 @@ impl PaneRuntime {
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.note_multisize_input();
         self.io.try_send_bytes(bytes)
     }
 
@@ -3495,6 +3653,7 @@ impl PaneRuntime {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.note_multisize_input();
         self.io
             .queue_user_input_submission(text, enter, delay, deadline)
     }
@@ -3826,6 +3985,7 @@ impl PaneRuntime {
                 preserve_processes_on_drop: true,
                 compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
+                multisize: None,
             },
             rx,
         )
@@ -4999,6 +5159,7 @@ mod tests {
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
+            multisize: None,
         };
 
         assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
@@ -5043,6 +5204,7 @@ mod tests {
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
+            multisize: None,
         };
 
         assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
