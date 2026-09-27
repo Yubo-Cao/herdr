@@ -1,6 +1,6 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted herdr.dev update manifest for newer versions.
+//! Checks the Thyra fork's release manifest for newer versions.
 //! Manual `herdr update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
-const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/Yubo-Cao/herdr/releases/latest/download/latest.json";
+const UPDATE_MANIFEST_URL_ENV: &str = "HERDR_UPDATE_MANIFEST_URL";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
@@ -61,17 +61,26 @@ fn fake_release_notes_body(version: &str) -> String {
 // Version
 // ---------------------------------------------------------------------------
 
-/// Parsed semver version for comparison.
+/// Release version, with an optional numeric Thyra revision.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    // Fork revisions follow the base release, rather than semver prerelease ordering.
+    pub thyra_revision: Option<u32>,
 }
 
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        let (s, thyra_revision) = match s.split_once("-thyra.") {
+            Some((base, revision)) if revision.bytes().all(|byte| byte.is_ascii_digit()) => {
+                (base, Some(revision.parse().ok()?))
+            }
+            Some(_) => return None,
+            None => (s, None),
+        };
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -80,17 +89,24 @@ impl Version {
             major: parts[0].parse().ok()?,
             minor: parts[1].parse().ok()?,
             patch: parts[2].parse().ok()?,
+            thyra_revision,
         })
     }
 
     pub fn current() -> Self {
-        Self::parse(crate::build_info::BASE_VERSION).expect("invalid CARGO_PKG_VERSION")
+        Self::parse(&crate::build_info::version())
+            .or_else(|| Self::parse(crate::build_info::BASE_VERSION))
+            .expect("invalid CARGO_PKG_VERSION")
     }
 }
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(revision) = self.thyra_revision {
+            write!(f, "-thyra.{revision}")?;
+        }
+        Ok(())
     }
 }
 
@@ -255,16 +271,6 @@ struct PreviewBuildMetadata {
     assets: BTreeMap<String, AssetRef>,
 }
 
-#[derive(Deserialize)]
-struct HomebrewFormula {
-    versions: HomebrewFormulaVersions,
-}
-
-#[derive(Deserialize)]
-struct HomebrewFormulaVersions {
-    stable: String,
-}
-
 impl UpdateManifest {
     #[cfg(all(test, unix))]
     fn download_url_for(&self, os: &str, arch: &str) -> Option<String> {
@@ -326,11 +332,13 @@ impl ReleaseInfo {
 }
 
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+    let url = env::var(UPDATE_MANIFEST_URL_ENV)
+        .unwrap_or_else(|_| STABLE_UPDATE_MANIFEST_URL.to_string());
+    fetch_json_manifest(&url)
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+    Err("preview updates are disabled for the Thyra fork; use `herdr channel set stable`".into())
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -553,22 +561,12 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
     Ok(release)
 }
 
-fn parse_homebrew_formula_stable_version(input: &[u8]) -> Result<Version, String> {
-    let formula: HomebrewFormula = serde_json::from_slice(input)
-        .map_err(|e| format!("failed to parse Homebrew formula JSON: {e}"))?;
-    Version::parse(&formula.versions.stable).ok_or_else(|| {
-        format!(
-            "invalid stable version in Homebrew formula JSON: {}",
-            formula.versions.stable
-        )
-    })
-}
-
-fn homebrew_update_from_formula_json(
-    input: &[u8],
+fn homebrew_update_from_manifest(
+    manifest: &UpdateManifest,
     current: &Version,
 ) -> Result<Option<Version>, String> {
-    let latest = parse_homebrew_formula_stable_version(input)?;
+    let latest = Version::parse(&manifest.version)
+        .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
     if &latest <= current {
         return Ok(None);
     }
@@ -577,27 +575,7 @@ fn homebrew_update_from_formula_json(
 }
 
 fn check_homebrew_latest() -> Result<Option<Version>, String> {
-    let current = Version::current();
-
-    let output = crate::noninteractive_process::curl_command()
-        .args([
-            "-sfL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "10",
-            HOMEBREW_FORMULA_API_URL,
-        ])
-        .output()
-        .map_err(|e| format!("curl failed: {e}"))?;
-
-    if !output.status.success() {
-        return Err("failed to fetch Homebrew formula JSON".into());
-    }
-
-    homebrew_update_from_formula_json(&output.stdout, &current)
+    homebrew_update_from_manifest(&fetch_update_manifest()?, &Version::current())
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,7 +2483,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                thyra_revision: None,
             })
         );
     }
@@ -2517,7 +2496,8 @@ mod tests {
             Some(Version {
                 major: 0,
                 minor: 1,
-                patch: 0
+                patch: 0,
+                thyra_revision: None,
             })
         );
     }
@@ -2527,6 +2507,96 @@ mod tests {
         assert_eq!(Version::parse("1.2"), None);
         assert_eq!(Version::parse("abc"), None);
         assert_eq!(Version::parse(""), None);
+        for version in [
+            "0.9.1-thyra",
+            "0.9.1-thyra.",
+            "0.9.1-thyra.+1",
+            "0.9.1-thyra.-1",
+            "0.9.1-thyra.1.2",
+            "0.9.1-thyra.4294967296",
+            "0.9.1-preview.1",
+        ] {
+            assert_eq!(Version::parse(version), None, "{version}");
+        }
+    }
+
+    #[test]
+    fn thyra_version_parses_and_preserves_release_identity() {
+        let version = Version::parse("v0.9.1-thyra.2").unwrap();
+        assert_eq!((version.major, version.minor, version.patch), (0, 9, 1));
+        assert_eq!(version.thyra_revision, Some(2));
+        assert_eq!(version.to_string(), "0.9.1-thyra.2");
+    }
+
+    #[test]
+    fn thyra_version_ordering_uses_numeric_revisions_after_base_version() {
+        let versions = [
+            "0.9.1",
+            "0.9.1-thyra.1",
+            "0.9.1-thyra.2",
+            "0.9.1-thyra.10",
+            "0.9.2-thyra.1",
+        ];
+        for (index, current) in versions.iter().enumerate() {
+            let current = Version::parse(current).unwrap();
+            assert!(!stable_channel_should_install(&current, &current, false));
+            for latest in &versions[index + 1..] {
+                let latest = Version::parse(latest).unwrap();
+                assert!(stable_channel_should_install(&latest, &current, false));
+                assert!(!stable_channel_should_install(&current, &latest, false));
+            }
+        }
+    }
+
+    #[test]
+    fn preview_update_fetch_is_disabled() {
+        assert!(fetch_preview_manifest()
+            .err()
+            .expect("preview must not fetch upstream releases")
+            .contains("preview updates are disabled for the Thyra fork"));
+    }
+
+    #[test]
+    fn update_manifest_override_fetches_thyra_release() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(UPDATE_MANIFEST_URL_ENV);
+        let path = unique_test_socket_path("manifest").with_extension("json");
+        let (os, arch) = platform_target();
+        let url = format!(
+            "https://github.com/Yubo-Cao/herdr/releases/download/v99.0.0-thyra.2/herdr-{os}-{arch}"
+        );
+        let checksum = "a".repeat(64);
+        fs::write(
+            &path,
+            serde_json::json!({
+                "version": "99.0.0-thyra.2",
+                "notes": "Thyra fork release",
+                "assets": { format!("{os}-{arch}"): {
+                    "url": url,
+                    "sha256": checksum,
+                } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        env::set_var(
+            UPDATE_MANIFEST_URL_ENV,
+            format!("file://{}", path.display()),
+        );
+        let manifest = fetch_update_manifest();
+        if let Some(previous) = previous {
+            env::set_var(UPDATE_MANIFEST_URL_ENV, previous);
+        } else {
+            env::remove_var(UPDATE_MANIFEST_URL_ENV);
+        }
+        fs::remove_file(path).unwrap();
+
+        let release = release_info_from_manifest(&manifest.unwrap())
+            .unwrap()
+            .expect("new Thyra release");
+        assert_eq!(release.label(), "99.0.0-thyra.2");
+        assert_eq!(release.download_url, url);
+        assert_eq!(release.sha256.as_deref(), Some(checksum.as_str()));
     }
 
     #[test]
@@ -2689,35 +2759,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_homebrew_formula_stable_version_reads_versions_stable() {
-        let version = parse_homebrew_formula_stable_version(
-            br#"{"versions":{"stable":"0.5.10","head":"HEAD","bottle":true}}"#,
+    fn homebrew_update_uses_fork_manifest_latest() {
+        let current = Version::parse("0.9.1-thyra.1").unwrap();
+        let manifest = serde_json::from_str(
+            r#"{"version":"0.9.1-thyra.2","notes":"Thyra release","assets":{}}"#,
         )
         .unwrap();
+        let update = homebrew_update_from_manifest(&manifest, &current).unwrap();
 
-        assert_eq!(version, Version::parse("0.5.10").unwrap());
+        assert_eq!(update, Some(Version::parse("0.9.1-thyra.2").unwrap()));
     }
 
     #[test]
-    fn homebrew_formula_update_uses_formula_stable_not_manifest_latest() {
-        let current = Version::parse("0.6.1").unwrap();
-        let update = homebrew_update_from_formula_json(
-            br#"{"versions":{"stable":"0.6.2","head":"HEAD","bottle":true}}"#,
-            &current,
+    fn homebrew_update_ignores_versions_that_are_not_newer() {
+        let current = Version::parse("0.9.1-thyra.2").unwrap();
+        let manifest = serde_json::from_str(
+            r#"{"version":"0.9.1-thyra.2","notes":"Thyra release","assets":{}}"#,
         )
         .unwrap();
-
-        assert_eq!(update, Some(Version::parse("0.6.2").unwrap()));
-    }
-
-    #[test]
-    fn homebrew_formula_update_ignores_versions_that_are_not_newer() {
-        let current = Version::parse("0.6.2").unwrap();
-        let update = homebrew_update_from_formula_json(
-            br#"{"versions":{"stable":"0.6.2","head":"HEAD","bottle":true}}"#,
-            &current,
-        )
-        .unwrap();
+        let update = homebrew_update_from_manifest(&manifest, &current).unwrap();
 
         assert_eq!(update, None);
     }
@@ -3398,6 +3458,7 @@ mod tests {
             major: 0,
             minor: 1,
             patch: 0,
+            thyra_revision: None,
         };
         assert_eq!(v.to_string(), "0.1.0");
     }
@@ -3406,6 +3467,9 @@ mod tests {
     fn current_version_parses() {
         let v = Version::current();
         assert!(v.major < 100);
+        if !crate::build_info::is_preview() {
+            assert_eq!(v.to_string(), crate::build_info::version());
+        }
     }
 
     #[test]

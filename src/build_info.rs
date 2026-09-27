@@ -12,7 +12,10 @@ pub fn build_id() -> Option<&'static str> {
 
 pub fn version() -> String {
     match channel() {
-        "stable" => BASE_VERSION.to_string(),
+        // Thyra release builds embed the full fork tag without changing the channel.
+        "stable" => non_empty(option_env!("HERDR_VERSION"))
+            .unwrap_or(BASE_VERSION)
+            .to_string(),
         channel => match build_id() {
             Some(build_id) => format!("{BASE_VERSION}-{channel}.{build_id}"),
             None => format!("{BASE_VERSION}-{channel}"),
