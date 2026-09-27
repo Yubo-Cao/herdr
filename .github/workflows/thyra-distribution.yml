@@ -142,7 +142,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/herdr" "${{ matrix.name }}"
           file "${{ matrix.name }}"
           # Static musl binaries run on glibc and musl distributions alike.
-          ldd "${{ matrix.name }}" 2>&1 | grep -Eq "statically linked|not a dynamic executable"
+          # ldd cannot inspect foreign-architecture binaries; file(1) can.
+          file "${{ matrix.name }}" | grep -q "statically linked"
           if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
             test "$("./${{ matrix.name }}" --version)" = "herdr $HERDR_VERSION"
           fi
