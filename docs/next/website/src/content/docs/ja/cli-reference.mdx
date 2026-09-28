@@ -117,12 +117,22 @@ compinit
 
 ```bash
 herdr server
+herdr server --adopt
+herdr server supervision
 herdr server stop
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
+
+`herdr server --adopt` は、起動したプロセスしか追跡しないサービスマネージャー(`KeepAlive` を `SuccessfulExit = false` にした launchd の LaunchAgent など)向けです。
+ライブハンドオフの後もこのプロセスは小さな監視プロセスとして残り、以降のハンドオフに追従し、サーバーが意図的に停止したら 0、クラッシュしたら 0 以外で終了します。
+監視プロセスへの SIGTERM はサーバーを停止します。
+すでにサーバーが動いている場合は、ライブハンドオフでそのペインを引き継いで監視します。
+別のプロセスがすでに監視している場合や引き継げない場合は、動作中のサーバーに触れずに 0 で終了します。
+`herdr server supervision` は、動作中のサーバーと監視プロセスの pid を JSON で表示します。
+systemd では `ExitType=cgroup` によりサービスの cgroup でハンドオフを追跡できるため、これは不要です。
 
 `herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
 

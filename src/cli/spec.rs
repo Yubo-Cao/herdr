@@ -159,7 +159,13 @@ fn channel_command() -> Command {
 fn server_command() -> Command {
     Command::new("server")
         .about("Run or control the headless server")
+        .arg(flag("adopt").help(
+            "Run under a supervisor without cgroup tracking (launchd): adopt a running server by live handoff and keep supervising across handoffs",
+        ))
         .subcommand(Command::new("stop").about("Stop the running server"))
+        .subcommand(
+            Command::new("supervision").about("Print the server pid and supervisor state as JSON"),
+        )
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")

@@ -246,6 +246,8 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    /// The replacement server's pid once a live handoff has committed.
+    handoff_successor_pid: Option<u32>,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
@@ -377,6 +379,7 @@ impl HeadlessServer {
             shutting_down: false,
             host_shutdown_requested: Arc::new(AtomicBool::new(false)),
             handoff_in_progress: false,
+            handoff_successor_pid: None,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
             should_quit,

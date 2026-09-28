@@ -1209,6 +1209,12 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 }
 
+/// Program path that re-executes the running image, even after an upgrade
+/// replaced the file it was started from.
+pub(crate) fn reexec_path() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from("/proc/self/exe"))
+}
+
 pub fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;

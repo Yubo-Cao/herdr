@@ -9,6 +9,9 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
         "stop" => server_stop(&args[1..]).map(Some),
         "live-handoff" => server_live_handoff(&args[1..]).map(Some),
         "--handoff-import" => Ok(None),
+        crate::server::supervision::ADOPT_FLAG if args.len() == 1 => Ok(None),
+        crate::server::supervision::ANCHOR_FLAG => Ok(None),
+        "supervision" => server_supervision(&args[1..]).map(Some),
         "reload-config" => server_reload_config(&args[1..]).map(Some),
         "agent-manifests" => server_agent_manifests(&args[1..]).map(Some),
         "update-agent-manifests" => server_update_agent_manifests(&args[1..]).map(Some),
@@ -41,6 +44,17 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
             Ok(1)
         }
     }
+}
+
+/// Prints supervision state as JSON. Service installers also use its exit
+/// status to learn whether this build supports `herdr server --adopt`.
+fn server_supervision(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr server supervision");
+        return Ok(2);
+    }
+    println!("{}", crate::server::supervision::supervision_status());
+    Ok(0)
 }
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
@@ -259,6 +273,11 @@ fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHandoffParams>
 fn print_server_help() {
     eprintln!("herdr server commands:");
     eprintln!("  herdr server                run as headless server");
+    eprintln!("  herdr server --adopt        run under launchd-style supervision: adopt a running");
+    eprintln!(
+        "                              server by live handoff and stay supervising across handoffs"
+    );
+    eprintln!("  herdr server supervision    print the server pid and supervisor state as JSON");
     eprintln!("  herdr server stop           stop the running server via the API socket");
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");

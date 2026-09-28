@@ -121,6 +121,8 @@ compinit
 
 ```bash
 herdr server
+herdr server --adopt
+herdr server supervision
 herdr server stop
 herdr server reload-config
 herdr server agent-manifests [--json]
@@ -128,7 +130,13 @@ herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
 
-`herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
+`herdr server` runs the headless server explicitly. Use it for supervised or service-style setups.
+`herdr server --adopt` is for service managers that track only the process they started, such as a launchd LaunchAgent with `KeepAlive` set to `SuccessfulExit = false`.
+After a live handoff, that process stays alive as a small supervisor that follows every later handoff and exits 0 when the server stops on purpose, or non-zero when it crashes.
+SIGTERM to the supervisor stops the server.
+If a server is already running, `--adopt` moves its panes into a replacement server through a live handoff and supervises it; if another process already supervises it, or adoption is impossible, it exits 0 without touching the running server.
+`herdr server supervision` prints the running server's pid and the supervising pid as JSON.
+systemd units need none of this: with `ExitType=cgroup` systemd follows a handoff through the service cgroup. `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
 
 ## Notifications
 

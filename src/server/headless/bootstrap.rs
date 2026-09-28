@@ -3,7 +3,12 @@ use super::*;
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(unix)]
+    if args.get(2).map(String::as_str) == Some(crate::server::supervision::ANCHOR_FLAG) {
+        crate::server::supervision::run_anchor_command(&args[3..]);
+    }
     let handoff_import = args.get(2).map(String::as_str) == Some("--handoff-import");
+    let adopt = args.get(2).map(String::as_str) == Some(crate::server::supervision::ADOPT_FLAG);
     let process_context = crate::platform::prepare_server_process(handoff_import);
     init_logging();
     match process_context {
@@ -23,8 +28,19 @@ pub fn run_server() -> io::Result<()> {
         let token = args
             .get(4)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        let successor = run_handoff_import_server(&socket_path, token)?;
+        if successor.is_none() {
+            crate::server::supervision::record_server_stopped();
+        }
+        return Ok(());
     }
+
+    // `--adopt` holds the supervisor lock for the life of this process, which
+    // becomes an anchor after a handoff instead of exiting.
+    #[cfg(unix)]
+    let supervisor = adopt.then(crate::server::supervision::acquire_or_exit);
+    #[cfg(not(unix))]
+    let _ = adopt;
 
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -39,6 +55,10 @@ pub fn run_server() -> io::Result<()> {
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            #[cfg(unix)]
+            if let Some(lock) = supervisor {
+                crate::server::supervision::adopt_running_server(lock);
+            }
             eprintln!("error: herdr server is already running");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(1);
@@ -74,10 +94,12 @@ pub fn run_server() -> io::Result<()> {
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
                 eprintln!("error: herdr server is already running");
                 eprintln!("client socket: {}", client_socket_path().display());
-                std::process::exit(1);
+                // Under a supervisor, a status that would be restarted only spins.
+                std::process::exit(if adopt { 0 } else { 1 });
             }
             Err(err) => return Err(err),
         };
+        crate::server::supervision::record_server_running();
 
         info!(
             api_socket = %api::socket_path().display(),
@@ -87,12 +109,23 @@ pub fn run_server() -> io::Result<()> {
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
 
-        server.run().await
+        server.run().await.map(|()| server.handoff_successor_pid)
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
-    result
+    match result? {
+        #[cfg(unix)]
+        Some(successor) => {
+            if let Some(lock) = supervisor {
+                crate::server::supervision::become_anchor(successor, lock);
+            }
+        }
+        #[cfg(not(unix))]
+        Some(_) => {}
+        None => crate::server::supervision::record_server_stopped(),
+    }
+    Ok(())
 }
 
 fn seed_startup_workspace_if_empty(app: &mut app::App) {
@@ -125,8 +158,10 @@ fn take_startup_cwd() -> Option<PathBuf> {
     (!cwd.is_empty()).then(|| PathBuf::from(cwd))
 }
 
+/// Runs a replacement server; returns its own successor's pid if it later
+/// handed off in turn.
 #[cfg(unix)]
-fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<Option<u32>> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
@@ -187,6 +222,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.api_window_title = received.manifest.api_window_title.take();
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        // Before acknowledging ownership, so the source's supervisor finds this
+        // process as soon as the source exits.
+        crate::server::supervision::record_server_running();
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
@@ -196,7 +234,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
-        server.run().await
+        server.run().await.map(|()| server.handoff_successor_pid)
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
@@ -205,7 +243,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 }
 
 #[cfg(not(unix))]
-fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()> {
+fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<Option<u32>> {
     Err(io::Error::other("live handoff is only supported on Unix"))
 }
 

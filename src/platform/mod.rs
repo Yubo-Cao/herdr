@@ -271,6 +271,13 @@ pub fn current_process_is_detached_server_daemon() -> bool {
     unsafe { libc::getsid(0) == libc::getpid() }
 }
 
+/// Program path that re-executes the running image. macOS resolves the path
+/// the process was launched from, which an upgrade may have replaced.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn reexec_path() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
+}
+
 /// Raised by the SIGWINCH handler, consumed by the host resize watcher.
 #[cfg(unix)]
 static TERMINAL_RESIZE_SIGNALLED: std::sync::atomic::AtomicBool =

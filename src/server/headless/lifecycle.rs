@@ -225,6 +225,7 @@ impl HeadlessServer {
             runtime.preserve_for_handoff();
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
+        self.handoff_successor_pid = Some(child_pid);
 
         Ok(())
     }

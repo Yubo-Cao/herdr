@@ -117,12 +117,21 @@ compinit
 
 ```bash
 herdr server
+herdr server --adopt
+herdr server supervision
 herdr server stop
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
+
+`herdr server --adopt` 用于只跟踪自己启动的进程的服务管理器,例如 `KeepAlive` 设为 `SuccessfulExit = false` 的 launchd LaunchAgent。
+实时交接之后,该进程会保留为一个很小的监管进程,跟随之后的每次交接;服务器被有意停止时它以 0 退出,崩溃时以非 0 退出。
+向监管进程发送 SIGTERM 会停止服务器。
+如果已有服务器在运行,`--adopt` 通过实时交接接管它的窗格并开始监管;如果已有其他进程在监管,或无法接管,它会以 0 退出,不碰正在运行的服务器。
+`herdr server supervision` 以 JSON 打印运行中服务器和监管进程的 pid。
+systemd 不需要这些:`ExitType=cgroup` 让 systemd 通过服务 cgroup 跟随交接。
 
 `herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
 
