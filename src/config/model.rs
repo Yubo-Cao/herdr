@@ -261,6 +261,10 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
     /// Render Kitty graphics in compatible outer terminals. Default: true.
     pub kitty_graphics: Option<bool>,
+    /// Turn the mouse wheel into Up/Down cursor keys over alternate-screen apps
+    /// that do not enable mouse reporting, such as `less` and `man`, unless the
+    /// app resets alternate scroll mode (DECRST 1007). Default: true.
+    pub alternate_scroll: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1882,6 +1886,13 @@ mouse_scroll_lines = 1
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.mouse_scroll_lines(), 1);
+    }
+
+    #[test]
+    fn terminal_alternate_scroll_defaults_on_and_parses() {
+        assert!(Config::default().alternate_scroll_enabled());
+        let config: Config = toml::from_str("[terminal]\nalternate_scroll = false\n").unwrap();
+        assert!(!config.alternate_scroll_enabled());
     }
 
     #[test]

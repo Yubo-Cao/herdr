@@ -104,6 +104,10 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn alternate_scroll_enabled(&self) -> bool {
+        self.terminal.alternate_scroll.unwrap_or(true)
+    }
+
     pub fn prefix_key(&self) -> (KeyCode, KeyModifiers) {
         self.validated_keybinds().1
     }

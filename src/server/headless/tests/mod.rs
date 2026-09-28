@@ -5753,6 +5753,105 @@ fn terminal_attach_page_key_forwards_in_alternate_screen_without_mouse_reporting
     });
 }
 
+fn apply_client_pane_wheel(
+    runtime: &crate::terminal::TerminalRuntime,
+    kind: crate::protocol::ClientMouseKind,
+    lines: u16,
+) {
+    apply_client_pane_input_events(
+        runtime,
+        &[crate::protocol::ClientPaneInputEvent::Mouse {
+            kind,
+            position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+            geometry: None,
+            modifiers: 0,
+            lines,
+        }],
+    )
+    .expect("wheel input");
+}
+
+#[test]
+fn client_pane_wheel_sends_its_lines_as_cursor_keys_in_alternate_scroll_mode() {
+    with_terminal_attach_runtime(b"\x1b[?1049h", 0, |runtime, input_rx| {
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollUp, 3);
+        assert_eq!(
+            input_rx.try_recv().expect("alternate scroll keys"),
+            Bytes::from_static(b"\x1b[A\x1b[A\x1b[A")
+        );
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollDown, 2);
+        assert_eq!(
+            input_rx.try_recv().expect("alternate scroll keys"),
+            Bytes::from_static(b"\x1b[B\x1b[B")
+        );
+    });
+}
+
+#[test]
+fn client_pane_wheel_alternate_scroll_follows_application_cursor_keys() {
+    with_terminal_attach_runtime(b"\x1b[?1049h\x1b[?1h", 0, |runtime, input_rx| {
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollDown, 2);
+        assert_eq!(
+            input_rx.try_recv().expect("alternate scroll keys"),
+            Bytes::from_static(b"\x1bOB\x1bOB")
+        );
+    });
+}
+
+#[test]
+fn client_pane_wheel_alternate_scroll_caps_its_key_count() {
+    with_terminal_attach_runtime(b"\x1b[?1049h", 0, |runtime, input_rx| {
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollUp, 1000);
+        assert_eq!(
+            input_rx.try_recv().expect("alternate scroll keys"),
+            Bytes::from(b"\x1b[A".repeat(usize::from(crate::pane::ALTERNATE_SCROLL_MAX_LINES)))
+        );
+    });
+}
+
+#[test]
+fn client_pane_wheel_keeps_host_scroll_when_the_app_resets_alternate_scroll() {
+    with_terminal_attach_runtime(b"\x1b[?1049h\x1b[?1007l", 0, |runtime, input_rx| {
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::HostScroll)
+        );
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollUp, 3);
+        assert!(input_rx.try_recv().is_err());
+    });
+}
+
+#[test]
+fn client_pane_wheel_reports_one_mouse_wheel_to_mouse_reporting_apps() {
+    with_terminal_attach_runtime(
+        b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
+        0,
+        |runtime, input_rx| {
+            apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollUp, 3);
+            assert_eq!(
+                input_rx.try_recv().expect("mouse wheel report"),
+                Bytes::from_static(b"\x1b[<64;3;2M")
+            );
+            assert!(input_rx.try_recv().is_err());
+        },
+    );
+}
+
+#[test]
+fn client_pane_wheel_scrolls_normal_screen_history_without_input() {
+    with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
+        apply_client_pane_wheel(runtime, crate::protocol::ClientMouseKind::ScrollUp, 3);
+        assert_eq!(
+            runtime
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            3
+        );
+        assert!(input_rx.try_recv().is_err());
+    });
+}
+
 #[test]
 fn headless_scheduled_tasks_expire_agent_metadata() {
     let mut server = test_headless_server();

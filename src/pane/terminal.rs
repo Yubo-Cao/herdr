@@ -1986,13 +1986,12 @@ impl GhosttyPaneTerminal {
             || core.terminal.mode_get(MODE_MOUSE_BUTTON_MOTION).ok()?
             || core.terminal.mode_get(MODE_MOUSE_PRESS_RELEASE).ok()?
             || core.terminal.mode_get(MODE_MOUSE_X10).ok()?;
-        Some(if mouse_reporting {
-            crate::pane::WheelRouting::MouseReport
-        } else if alternate_screen && mouse_alternate_scroll {
-            crate::pane::WheelRouting::AlternateScroll
-        } else {
-            crate::pane::WheelRouting::HostScroll
-        })
+        Some(crate::pane::WheelRouting::resolve(
+            mouse_reporting,
+            alternate_screen,
+            mouse_alternate_scroll,
+            crate::pane::alternate_scroll_enabled(),
+        ))
     }
 
     pub fn cursor_state(&self) -> Option<TerminalCursorState> {

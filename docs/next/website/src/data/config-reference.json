@@ -470,6 +470,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Render pane images in Kitty graphics-compatible outer terminals. Set false to disable graphics rendering and the pane graphics API. Restart the server or reattach the client after changing it. In remote sessions, server configuration controls parsing and API availability while local client configuration controls outer-terminal output."
+        },
+        {
+          "key": "terminal.alternate_scroll",
+          "type": "boolean",
+          "default": "true",
+          "description": "Scroll full-screen apps that do not enable mouse reporting, such as less and man, with the mouse wheel. Over the alternate screen, each wheel step sends ui.mouse_scroll_lines Up or Down cursor keys in the app's cursor key mode, unless the app turns off alternate scroll mode (DECRST 1007). Set false to keep the wheel on Herdr's scrollback there. Takes effect on reload."
         }
       ]
     },

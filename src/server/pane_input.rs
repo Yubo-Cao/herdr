@@ -169,7 +169,7 @@ fn apply_scroll(
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
             runtime.scroll_reset();
-            let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
+            let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind, lines) else {
                 return Ok(());
             };
             runtime

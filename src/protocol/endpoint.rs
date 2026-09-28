@@ -36,6 +36,11 @@ pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
 /// always makes that shell the foreground client and its tab's size owner.
 pub const INPUT_GEOMETRY_CAPABILITY: &str = "input_geometry";
 pub const INPUT_GEOMETRY_KIND: &str = "endpoint.input-geometry.v1";
+/// A wheel in pane input over an alternate-screen app without mouse reporting
+/// becomes its `lines` of Up/Down cursor keys (DECSET 1007, `[terminal]
+/// alternate_scroll`), so a client may send such wheels instead of scrolling
+/// history. Without it, the server sends one key per wheel event at most.
+pub const ALTERNATE_SCROLL_CAPABILITY: &str = "alternate_scroll";
 
 /// Whether later pane and popup input from this shell may take foreground and
 /// tab-geometry ownership. A client relaying input typed on another device
@@ -188,6 +193,7 @@ impl EndpointServerWelcome {
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
                 INPUT_GEOMETRY_CAPABILITY.into(),
+                ALTERNATE_SCROLL_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -397,6 +403,7 @@ mod tests {
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
                 INPUT_GEOMETRY_CAPABILITY.to_string(),
+                ALTERNATE_SCROLL_CAPABILITY.to_string(),
             ]
         );
     }

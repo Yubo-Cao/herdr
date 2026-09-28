@@ -562,8 +562,9 @@ impl TerminalRuntime {
     pub fn encode_alternate_scroll(
         &self,
         kind: crossterm::event::MouseEventKind,
+        lines: u16,
     ) -> Option<Vec<u8>> {
-        self.0.encode_alternate_scroll(kind)
+        self.0.encode_alternate_scroll(kind, lines)
     }
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {

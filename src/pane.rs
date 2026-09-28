@@ -1515,6 +1515,43 @@ pub enum WheelRouting {
     AlternateScroll,
 }
 
+/// `[terminal] alternate_scroll`: whether a wheel over an alternate-screen app
+/// that has not enabled mouse reporting becomes cursor keys (DECSET 1007).
+static ALTERNATE_SCROLL_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Most cursor keys a single wheel event sends in alternate scroll mode, so a
+/// client asking for a large line count cannot flood the application.
+pub const ALTERNATE_SCROLL_MAX_LINES: u16 = 64;
+
+pub(crate) fn set_alternate_scroll_enabled(enabled: bool) {
+    ALTERNATE_SCROLL_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub(crate) fn alternate_scroll_enabled() -> bool {
+    ALTERNATE_SCROLL_ENABLED.load(Ordering::Acquire)
+}
+
+impl WheelRouting {
+    /// Where a wheel goes, as real terminals decide it: to an app that asked
+    /// for mouse reports; as cursor keys to an alternate-screen app when the
+    /// app has left alternate scroll mode (DECSET 1007, on by default) set and
+    /// the configuration allows it; otherwise to Herdr's scrollback.
+    pub(crate) fn resolve(
+        mouse_reporting: bool,
+        alternate_screen: bool,
+        alternate_scroll_mode: bool,
+        alternate_scroll_enabled: bool,
+    ) -> Self {
+        if mouse_reporting {
+            Self::MouseReport
+        } else if alternate_screen && alternate_scroll_mode && alternate_scroll_enabled {
+            Self::AlternateScroll
+        } else {
+            Self::HostScroll
+        }
+    }
+}
+
 impl Drop for PaneRuntime {
     fn drop(&mut self) {
         // Abort detection task immediately and terminate the owned session.
@@ -3584,9 +3621,13 @@ impl PaneRuntime {
         (width > 0 && height > 0).then_some((width, height))
     }
 
+    /// A wheel of `lines` in alternate scroll mode: that many Up or Down cursor
+    /// keys (at most `ALTERNATE_SCROLL_MAX_LINES`), encoded for the pane's
+    /// cursor key mode (DECCKM), as a terminal would send them.
     pub fn encode_alternate_scroll(
         &self,
         kind: crossterm::event::MouseEventKind,
+        lines: u16,
     ) -> Option<Vec<u8>> {
         if self.wheel_routing()? != WheelRouting::AlternateScroll {
             return None;
@@ -3596,10 +3637,11 @@ impl PaneRuntime {
             crossterm::event::MouseEventKind::ScrollDown => crossterm::event::KeyCode::Down,
             _ => return None,
         };
-        Some(self.encode_terminal_key(crate::input::TerminalKey::new(
+        let press = self.encode_terminal_key(crate::input::TerminalKey::new(
             key,
             crossterm::event::KeyModifiers::empty(),
-        )))
+        ));
+        Some(press.repeat(usize::from(lines.clamp(1, ALTERNATE_SCROLL_MAX_LINES))))
     }
 
     /// Get the current working directory of the child shell process.
@@ -4845,6 +4887,21 @@ mod tests {
                 color_scheme_reporting: true,
             })
         );
+    }
+
+    #[test]
+    fn wheel_routing_resolves_like_a_terminal_with_alternate_scroll() {
+        use WheelRouting::{AlternateScroll, HostScroll, MouseReport};
+        // mouse reporting, alternate screen, DECSET 1007, [terminal] alternate_scroll
+        assert_eq!(WheelRouting::resolve(true, true, true, true), MouseReport);
+        assert_eq!(WheelRouting::resolve(true, false, true, false), MouseReport);
+        assert_eq!(
+            WheelRouting::resolve(false, true, true, true),
+            AlternateScroll
+        );
+        assert_eq!(WheelRouting::resolve(false, false, true, true), HostScroll);
+        assert_eq!(WheelRouting::resolve(false, true, false, true), HostScroll);
+        assert_eq!(WheelRouting::resolve(false, true, true, false), HostScroll);
     }
 
     #[cfg(unix)]

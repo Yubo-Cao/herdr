@@ -120,6 +120,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Render pane images in Kitty graphics-compatible outer terminals.
 # kitty_graphics = true
 
+# Scroll full-screen apps without mouse support, such as less and man, with the mouse wheel.
+# Over the alternate screen, a wheel notch becomes Up/Down cursor keys unless the app turns off alternate scroll mode (DECRST 1007).
+# Set false to keep the wheel on Herdr's scrollback there.
+# alternate_scroll = true
+
 [update]
 # Update channel used by background version checks and `herdr update`.
 # Stable builds default to "stable". Windows preview builds default to "preview"
