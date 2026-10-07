@@ -1,12 +1,16 @@
 id = "codex"
-version = "2026.09.22.1"
+version = "2026.10.07.1"
 min_engine_version = 3
-updated_at = "2026-09-22T00:00:00Z"
+updated_at = "2026-10-07T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
 state = "blocked"
-priority = 1100
+# "Action Required" also covers request_user_input_async questions, which do
+# not end the turn. Rank it below the live screen timer so a turn that keeps
+# running with a pending question stays working; approvals and blocking
+# questions hide the timer, so the title still wins for them.
+priority = 450
 region = "osc_title"
 visible_blocker = true
 contains = ["Action Required"]
@@ -18,6 +22,8 @@ priority = 1050
 region = "osc_title"
 visible_working = true
 regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+# While "Action Required" is shown, a spinner only fills the pending thread-title slot.
+not = [{ contains = ["Action Required"] }]
 
 [[rules]]
 id = "transcript_viewer"
@@ -82,7 +88,9 @@ any = [
 [[rules]]
 id = "screen_working_fallback"
 state = "working"
-priority = 500
+# Above weak_blocker: an expanded async question ("Do you want to ...? Yes")
+# hides the composer while the turn is still running.
+priority = 650
 region = "before_current_prompt_marker"
 visible_working = true
 # Support animated and reduced-motion status, including dynamic activity labels.
