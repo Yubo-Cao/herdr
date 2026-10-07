@@ -5165,6 +5165,163 @@ mod tests {
         assert_eq!(encoded, b"\x1b[13;2u");
     }
 
+    /// Browser shells (Thyra) send semantic keys built from DOM KeyboardEvents:
+    /// the unshifted layout character, the shifted one, modifiers, and text
+    /// only for plain or Shift-only keys. Each pane encodes them like Ghostty.
+    #[test]
+    fn semantic_browser_keys_encode_for_legacy_and_kitty_panes() {
+        use crate::protocol::{ClientKeyCode, ClientKeyKind, ClientPaneInputEvent};
+        use crossterm::event::KeyModifiers as M;
+
+        fn semantic(
+            code: ClientKeyCode,
+            modifiers: M,
+            shifted: Option<char>,
+            text: Option<&str>,
+            kind: ClientKeyKind,
+        ) -> crate::input::TerminalKey {
+            let event = ClientPaneInputEvent::Key {
+                code,
+                modifiers: modifiers.bits(),
+                kind,
+                repeat_count: 1,
+                shifted_codepoint: shifted.map(u32::from),
+                generated_text: text.map(str::to_owned),
+                tracks_release: true,
+                physical_key_id: None,
+                windows_record: None,
+            };
+            match event.to_raw_input_event() {
+                crate::raw_input::RawInputEvent::Key(key) => key,
+                other => panic!("expected a key, got {other:?}"),
+            }
+        }
+
+        let press = ClientKeyKind::Press;
+        let cases: Vec<(&str, crate::input::TerminalKey, &[u8], &[u8], &[u8])> = vec![
+            (
+                "Ctrl+/",
+                semantic(ClientKeyCode::Char('/'), M::CONTROL, None, None, press),
+                b"\x1f",
+                b"\x1b[47;5u",
+                b"\x1b[47;5:1u",
+            ),
+            (
+                "Ctrl+Shift+A",
+                semantic(
+                    ClientKeyCode::Char('a'),
+                    M::CONTROL | M::SHIFT,
+                    Some('A'),
+                    None,
+                    press,
+                ),
+                b"\x01",
+                b"\x1b[97;6u",
+                b"\x1b[97:65;6:1u",
+            ),
+            (
+                "Alt+Shift+F",
+                semantic(
+                    ClientKeyCode::Char('f'),
+                    M::ALT | M::SHIFT,
+                    Some('F'),
+                    None,
+                    press,
+                ),
+                b"\x1bF",
+                b"\x1b[102;4u",
+                b"\x1b[102:70;4:1u",
+            ),
+            (
+                "Ctrl+Enter",
+                semantic(ClientKeyCode::Enter, M::CONTROL, None, None, press),
+                b"\r",
+                b"\x1b[13;5u",
+                b"\x1b[13;5u",
+            ),
+            (
+                "Shift+Enter",
+                semantic(ClientKeyCode::Enter, M::SHIFT, None, None, press),
+                b"\r",
+                b"\x1b[13;2u",
+                b"\x1b[13;2u",
+            ),
+            (
+                "Ctrl+1",
+                semantic(ClientKeyCode::Char('1'), M::CONTROL, None, None, press),
+                b"1",
+                b"\x1b[49;5u",
+                b"\x1b[49;5:1u",
+            ),
+            (
+                // macOS Option as Alt sends the physical key, not "ƒ".
+                "Option+f",
+                semantic(ClientKeyCode::Char('f'), M::ALT, None, None, press),
+                b"\x1bf",
+                b"\x1b[102;3u",
+                b"\x1b[102;3:1u",
+            ),
+            (
+                "Shift+a",
+                semantic(
+                    ClientKeyCode::Char('a'),
+                    M::SHIFT,
+                    Some('A'),
+                    Some("A"),
+                    press,
+                ),
+                b"A",
+                b"A",
+                b"\x1b[97:65;2:1;65u",
+            ),
+            (
+                "a release",
+                semantic(
+                    ClientKeyCode::Char('a'),
+                    M::empty(),
+                    None,
+                    Some("a"),
+                    ClientKeyKind::Release,
+                ),
+                b"",
+                b"",
+                b"\x1b[97;1:3u",
+            ),
+            (
+                "Cmd+k",
+                semantic(ClientKeyCode::Char('k'), M::SUPER, None, None, press),
+                b"\x1b[107;9u",
+                b"\x1b[107;9u",
+                b"\x1b[107;9:1u",
+            ),
+        ];
+
+        for (pane_flags, column) in [
+            (None, 0),
+            (Some(b"\x1b[>1u".as_slice()), 1),
+            (Some(b"\x1b[>31u".as_slice()), 2),
+        ] {
+            let (tx, _rx) = mpsc::channel(4);
+            let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+            let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+            if let Some(push) = pane_flags {
+                pane.process_pty_bytes(PaneId::from_raw(1), 0, push, &tx);
+            }
+            let protocol = pane
+                .keyboard_protocol()
+                .unwrap_or(crate::input::KeyboardProtocol::Legacy);
+            for (name, key, legacy, kitty, kitty_all) in &cases {
+                let expected = [legacy, kitty, kitty_all][column];
+                let encoded = pane.encode_terminal_key(key.clone(), protocol);
+                assert_eq!(
+                    encoded.escape_ascii().to_string(),
+                    expected.escape_ascii().to_string(),
+                    "{name} with pane protocol {protocol:?}"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn ghostty_seed_keyboard_protocol_flags_restores_shift_enter_encoding() {
